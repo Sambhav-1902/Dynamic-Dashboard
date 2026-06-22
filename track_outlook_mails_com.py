@@ -1,62 +1,74 @@
+# -*- coding: utf-8 -*-
 """
-Outlook (Classic Desktop App) Mail Listener — COM Automation Version
------------------------------------------------------------------------
-This is the OFFICE LAPTOP version of the mail tracker. It automates the
-already-running, already-signed-in Outlook desktop application via COM
-(pywin32) — NO Microsoft Graph API, NO admin consent, NO app registration
-required. It only works on Windows with Outlook (Classic) installed.
+TechOps Mail Tracker — Office Laptop Version (Outlook COM)
+==========================================================
+Monitors your Outlook (Classic) inbox, logs incoming support emails to
+mail_tracker.xlsx, and keeps a live dashboard updated automatically.
 
-All AI logic, Excel writing, and dashboard generation are IDENTICAL to
-the Gmail version (track_outlook_mails.py) — only the email source
-changed.
+Differences from the personal laptop version (track_outlook_mails.py):
+  - Uses Outlook COM automation (pywin32) instead of Gmail IMAP
+  - No credentials required — attaches to the already-signed-in Outlook app
+  - Ollama model loaded from a local GGUF file (network blocks ollama pull)
+  - No username/password prompt at startup
 
-Each ticket is automatically assigned:
-- Status  (Pending, Ongoing, Resolved)
-- Category (multi-label, detected by AI)
-- Due Date (extracted by AI)
-- Followups counter
-- Ongoing Since (timestamp of when the ticket first became Ongoing,
-  used by the dashboard's "days ongoing" list)
+Everything else is identical: AI models, Excel structure, status logic,
+dashboard generation, retry queue.
 
-Status logic:
-- New ticket arrives                          -> Pending, Followups = 0, run category detection (once)
-- Reply from original sender + Pending        -> increment Followups, keep Pending
-- Reply from original sender + Ongoing        -> keep Ongoing
-- Reply from original sender + Resolved       -> NEW row (new issue), run category detection (once)
-- Reply from anyone else                      -> conversational resolution check (a small local
-                                                  instruction model reads the FULL conversation and
-                                                  decides if every question/issue from the original
-                                                  sender has been answered)
-                                                  -> Ongoing or Resolved. Defaults to Ongoing if
-                                                  the resolution model errors out.
+==========================================================
+SETUP — run these steps once before the first run
+==========================================================
 
-Category is detected once when a ticket is first created and does not
-change on replies — short reply text does not carry reliable category info.
-Category detection uses margin-based matching: the top-scoring category is
-always included, plus any category within 0.05 of the top score (provided
-the top score is at least 0.5). This can occasionally over-include or
-mis-categorize on certain short/ambiguous phrasings — see detect_categories()
-docstring for known edge cases.
+1. Install Python packages:
+       pip install pywin32 openpyxl sentence-transformers torch gliner parsedatetime requests
 
-Dashboard: a "Dashboard" sheet is regenerated as a static snapshot each
-time historical load completes (and once more when the script is
-stopped) — overview counts, a status pie chart, grouped Pending/Ongoing
-bar charts by category and by assignee, and a list of Ongoing tickets
-sorted by days-in-Ongoing. See update_dashboard() for details.
+2. Install Ollama (https://ollama.ai/download) — Windows installer.
+   After installation Ollama runs as a background service automatically.
 
-Requirements:
-    pip install pywin32 openpyxl sentence-transformers torch gliner parsedatetime requests
+3. Load the Gemma 3 1B model into Ollama from the local GGUF file:
+   a. Open Python and find where the GGUF was cached:
+          from huggingface_hub import hf_hub_download
+          print(hf_hub_download("bartowski/google_gemma-3-1b-it-GGUF",
+                                "google_gemma-3-1b-it-Q4_K_M.gguf"))
+   b. Create a plain text file called Modelfile (no extension) with:
+          FROM <path printed above>
+          PARAMETER temperature 0.1
+   c. In a terminal, from the folder where you saved the Modelfile:
+          ollama create gemma3:1b -f Modelfile
+   d. Verify it worked:
+          ollama run gemma3:1b "Reply YES"
 
-Also requires Ollama running locally with gemma3:1b imported from a local GGUF file.
-The model was imported using a Modelfile pointing at the locally cached GGUF:
-    1. Create a Modelfile containing: FROM <path to google_gemma-3-1b-it-Q4_K_M.gguf>
-    2. Run: ollama create gemma3:1b -f Modelfile
-    3. Verify: ollama run gemma3:1b "Reply with only YES"
-Ollama must be running when this script starts (check the system tray or run
-`ollama serve`). If unreachable, resolution checks default to Ongoing.
+4. Make sure Outlook (Classic) is open and signed in before running.
 
-Run:
+5. Update ALLOWED_EMAILS below to include your office email addresses.
+
+==========================================================
+HOW TO RUN
+==========================================================
+
     python track_outlook_mails_com.py
+
+The script will:
+  - Load AI models (~30s on first run)
+  - Connect to Outlook
+  - Load any emails since the last run (or last 24hrs if fresh file)
+  - Generate the dashboard
+  - Poll every 15 seconds for new emails
+  - Update the dashboard automatically whenever new data arrives
+  - Press Ctrl+C to stop (dashboard is refreshed one final time before exit)
+
+==========================================================
+STATUS LOGIC
+==========================================================
+
+  New email from allowed sender          -> New ticket, Status = Pending
+  Reply from original sender + Pending   -> Followups counter incremented
+  Reply from original sender + Ongoing   -> Status stays Ongoing
+  Reply from original sender + Resolved  -> Treated as a new ticket
+  Reply from anyone else                 -> Gemma checks the full conversation
+                                            -> Resolved or Ongoing
+
+Category is detected once at ticket creation (never on replies).
+Due dates are informational only — they do NOT change ticket status.
 """
 
 import win32com.client
@@ -81,41 +93,35 @@ from sentence_transformers import util as st_util
 
 OUTPUT_FILE          = "mail_tracker.xlsx"
 ALLOWED_SENDERS_FILE = "allowed_senders.txt"
-POLL_INTERVAL        = 15  # seconds between each inbox check
+POLL_INTERVAL        = 15  # seconds between inbox checks
 
-# MAPI property tag for the full raw transport headers (Message-ID,
-# In-Reply-To, Date) — same info the Gmail/IMAP version gets natively.
+# MAPI property tags used to read raw headers and resolve Exchange sender addresses
 PR_TRANSPORT_MESSAGE_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001E"
-# MAPI property tag for resolving "EX" (Exchange) sender addresses to SMTP
-PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+PR_SMTP_ADDRESS              = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 
-# olMail = 43 (MailItem.Class) — used to skip meeting requests, receipts, etc.
-OL_MAIL_ITEM    = 43
+OL_MAIL_ITEM    = 43  # MailItem.Class — skips meeting requests, receipts, etc.
 OL_FOLDER_INBOX = 6
 
-# AI models
+# Load AI models at startup
 print("Loading AI models...")
 deadline_model = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
-# Uses sentence embeddings + semantic similarity — fast (0.04s) and accurate
 from sentence_transformers import SentenceTransformer
-category_model     = SentenceTransformer('BAAI/bge-base-en-v1.5')
+category_model = SentenceTransformer('BAAI/bge-base-en-v1.5')
 print("AI models ready.\n")
 
-# Only emails from these senders will be saved.
+# Emails from these addresses are always accepted
 ALLOWED_EMAILS = [
     "sambhavsingwi@gmail.com",
     "cs1230722@iitd.ac.in",
 ]
 
-# Allow everyone from these domains
 ALLOWED_DOMAINS = [
     # "exlservice.com",
 ]
 
 
-# ---------------------------------------------------------------------------
-# Dynamic allowed senders management
-# ---------------------------------------------------------------------------
+# Allowed senders management
+
 
 def load_allowed_senders():
     senders = set(e.lower() for e in ALLOWED_EMAILS)
@@ -135,6 +141,7 @@ def save_allowed_senders(senders):
 
 
 def extract_and_update_senders(msg, current_allowed):
+    """Scans To/Cc/Bcc of a processed email and adds any new addresses to the allowed list."""
     new_addresses = []
     for header in ["To", "Cc", "Bcc"]:
         raw = msg.get(header, "")
@@ -154,26 +161,12 @@ def extract_and_update_senders(msg, current_allowed):
     return current_allowed
 
 
-# ---------------------------------------------------------------------------
-# Sender filter
-# ---------------------------------------------------------------------------
-
 def is_allowed(sender_email, allowed_senders):
-    sender_email = sender_email.lower().strip()
-    if sender_email in allowed_senders:
-        return True
-    return False
-
-    # Inactive: filter by domain
-    # sender_domain = sender_email.split("@")[-1]
-    # if sender_domain in [d.lower() for d in ALLOWED_DOMAINS]:
-    #     return True
-    # return False
+    return sender_email.lower().strip() in allowed_senders
 
 
-# ---------------------------------------------------------------------------
-# Email parsing helpers (COM equivalents of the Gmail/IMAP version)
-# ---------------------------------------------------------------------------
+# Email parsing (COM version)
+
 
 def decode_str(value):
     if not value:
@@ -200,19 +193,12 @@ def strip_html(text):
 
 
 def get_sender_smtp_address(item):
-    """
-    Returns a clean SMTP email address for the sender.
-    For internal Exchange senders, SenderEmailAddress returns an EX
-    format string instead of a normal SMTP email address.
-    PR_SMTP_ADDRESS resolves this to a clean address.
-    Confirmed working for both EX and SMTP sender types.
-    """
+    """Resolves the sender's SMTP address. Internal Exchange senders return an EX-format
+    address by default; PR_SMTP_ADDRESS converts this to a normal email address."""
     try:
-        sender = item.Sender  # AddressEntry
-        if sender is not None:
-            smtp = sender.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS)
-            if smtp:
-                return smtp
+        smtp = item.Sender.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS)
+        if smtp:
+            return smtp
     except Exception:
         pass
     try:
@@ -224,16 +210,8 @@ def get_sender_smtp_address(item):
 
 
 def parse_email_com(item):
-    """
-    Builds the same dict structure as parse_email() in the Gmail version,
-    but reads from an Outlook COM MailItem instead of raw IMAP bytes.
-
-    Gets the full raw transport headers via PropertyAccessor and parses
-    them with Python's email module — confirmed this gives real
-    Message-ID, In-Reply-To, and Date headers (with In-Reply-To correctly
-    pointing to the parent's Message-ID for replies), so
-    extract_and_update_senders() and find_matching_row() work unchanged.
-    """
+    """Reads an Outlook MailItem and returns the same dict structure as the Gmail version.
+    Uses PR_TRANSPORT_MESSAGE_HEADERS to get real Message-ID and In-Reply-To headers."""
     try:
         raw_headers = item.PropertyAccessor.GetProperty(PR_TRANSPORT_MESSAGE_HEADERS)
     except Exception:
@@ -243,13 +221,9 @@ def parse_email_com(item):
 
     sender_email = get_sender_smtp_address(item)
     sender_name  = getattr(item, "SenderName", "") or sender_email
+    subject      = getattr(item, "Subject", "") or "(No Subject)"
 
-    subject = getattr(item, "Subject", "") or "(No Subject)"
-
-    # Date — prefer the parsed header (matches IMAP version's timezone
-    # normalization, confirmed needed since headers can carry non-local
-    # offsets like -0700 PDT); fall back to Outlook's ReceivedTime if the
-    # header is missing or unparseable.
+    # Parse date from header and normalize to local timezone
     date_str = None
     header_date = msg.get("Date")
     if header_date:
@@ -262,30 +236,26 @@ def parse_email_com(item):
             date_str = None
     if date_str is None:
         try:
-            rt = item.ReceivedTime  # pywintypes datetime, already local
+            rt = item.ReceivedTime
             date_str = datetime(rt.year, rt.month, rt.day, rt.hour, rt.minute, rt.second).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Body — prefer plain text Body; fall back to stripped HTMLBody
     body = ""
     try:
         body = item.Body or ""
     except Exception:
-        body = ""
+        pass
     if not body.strip():
         try:
             body = strip_html(item.HTMLBody or "")
         except Exception:
-            body = ""
+            pass
     body = body.strip()[:2000]
 
     message_id  = msg.get("Message-ID", "").strip()
     in_reply_to = msg.get("In-Reply-To", "").strip()
 
-    # If headers were unavailable (e.g. item not yet fully synced), fall
-    # back to EntryID as a stable identifier so thread matching still has
-    # *something* to compare on subject at least.
     if not message_id:
         try:
             message_id = f"<entryid-{item.EntryID}@local>"
@@ -301,7 +271,7 @@ def parse_email_com(item):
         "message_id":   message_id,
         "in_reply_to":  in_reply_to,
         "raw_msg":      msg,
-        "_entry_id":    getattr(item, "EntryID", None),  # used for dedup tracking
+        "_entry_id":    getattr(item, "EntryID", None),
     }
 
 
@@ -313,99 +283,17 @@ def clean_subject(subject):
     return cleaned.lower()
 
 
-# ---------------------------------------------------------------------------
-# AI — Status detection
-# ---------------------------------------------------------------------------
+# AI — Conversational resolution check (Gemma 3 1B via Ollama)
 
-def strip_quoted_content(body):
-    """
-    Removes quoted/forwarded content from an email body, returning only
-    the new text the sender actually wrote. Handles common separator
-    patterns used by Outlook, Gmail, and other email clients.
-    """
-    text = body.strip()
-
-    # Separators that mark the start of quoted/forwarded content
-    separators = [
-        "________________________________",
-        "-----Original Message-----",
-        "-----Forwarded Message-----",
-        "-------- Original Message --------",
-        "-------------------------",
-    ]
-
-    for sep in separators:
-        idx = text.find(sep)
-        if idx > 5:
-            text = text[:idx].strip()
-            break
-
-    # Handle "On <date>, <name> wrote:" pattern (Gmail style)
-    on_wrote_pattern = re.compile(
-        r'\n?On\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,.*?wrote:',
-        re.IGNORECASE | re.DOTALL
-    )
-    match = on_wrote_pattern.search(text)
-    if match and match.start() > 5:
-        text = text[:match.start()].strip()
-
-    # Remove lines that start with '>' (quoted reply lines)
-    lines = text.split("\n")
-    clean_lines = [line for line in lines if not line.strip().startswith(">")]
-    text = "\n".join(clean_lines).strip()
-
-    # Remove common email disclaimer/caution footers
-    disclaimer_patterns = [
-        r'CAUTION:.*?safe\.',
-    ]
-    for pattern in disclaimer_patterns:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL).strip()
-
-    return text
-
-
-def get_first_300_words(body):
-    """
-    Returns the first 300 words of the latest reply only, with quoted
-    thread content stripped out.
-    """
-    text  = strip_quoted_content(body)
-    words = text.split()
-    return " ".join(words[:300])
-
-
-# ---------------------------------------------------------------------------
-# AI — Conversational resolution check (Gemma 3 1B via local Ollama)
-# ---------------------------------------------------------------------------
-#
-# Uses the same Ollama setup as the personal laptop version. The model
-# could not be downloaded via `ollama pull` (corporate network blocks
-# Ollama's registry), but was imported from a local GGUF file instead:
-#
-#   1. The GGUF was downloaded from Hugging Face (bartowski/google_gemma-3-1b-it-GGUF)
-#   2. A Modelfile was created pointing at the local file path
-#   3. `ollama create gemma3:1b -f Modelfile` registered it with Ollama
-#
-# Ollama runs as a background service on Windows after installation.
-# No extra Python packages needed — just the `requests` library (already
-# used elsewhere in this script).
 
 OLLAMA_URL   = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "gemma3:1b"
 
 
 def is_conversation_resolved(conversation_log, original_sender):
-    """
-    Asks gemma3:1b (via local Ollama) a single yes/no question: has EVERY
-    question/issue raised by original_sender been answered across the
-    WHOLE conversation (not just the latest reply)?
-
-    Identical to the personal laptop version — same model, same prompt,
-    same decision logic, same ~6-7s per call speed.
-
-    Returns True (Resolved) or False (Ongoing). Defaults to False if
-    Ollama is unreachable or gives an unclear response.
-    """
+    """Asks Gemma 3 1B (via local Ollama) whether every issue raised by original_sender
+    has been resolved across the full conversation. Returns True (Resolved) or False (Ongoing).
+    Defaults to False if Ollama is unreachable."""
     prompt = f"""Below is a support ticket conversation, shown NEWEST message first. Each message shows the sender's email and their message.
 
 Conversation:
@@ -428,7 +316,6 @@ Answer with ONLY one word: YES or NO."""
             "options": {"temperature": 0.1}
         }, timeout=30)
         text = response.json()["response"].strip().upper()
-
         if "YES" in text and "NO" not in text:
             return True
         elif "NO" in text:
@@ -436,17 +323,15 @@ Answer with ONLY one word: YES or NO."""
         else:
             print(f"   Unclear response from Gemma ({text!r}) — defaulting to Ongoing")
             return False
-
     except Exception as e:
         print(f"   Could not reach Ollama ({e}) — defaulting to Ongoing.")
         return False
 
 
-# ---------------------------------------------------------------------------
 # AI — Category detection
-# ---------------------------------------------------------------------------
 
-# Category labels — descriptive sentences work better for semantic similarity
+
+# Descriptive sentences used as category labels for semantic similarity matching
 CATEGORY_LABELS = [
     'unable to login or access account, password not working, account locked',
     'payment transaction failed, duplicate charge, refund error, amount wrongly deducted, EMI payment not going through',
@@ -459,7 +344,6 @@ CATEGORY_LABELS = [
     'how to do something, asking for information, no technical problem just a question',
 ]
 
-# Full display names mapped from labels
 LABEL_TO_FULL = {
     'unable to login or access account, password not working, account locked'              : 'Access and Login Issues',
     'payment transaction failed, duplicate charge, refund error, amount wrongly deducted, EMI payment not going through' : 'Payment Processing Issues',
@@ -472,13 +356,11 @@ LABEL_TO_FULL = {
     'how to do something, asking for information, no technical problem just a question'   : 'General Query',
 }
 
-CATEGORY_MARGIN        = 0.05  # categories within this margin of the top score are also included
-CATEGORY_MIN_TOP_SCORE = 0.5   # if even the top score is below this, text is too vague to categorize confidently
+CATEGORY_MARGIN        = 0.05  # include categories within this margin of the top score
+CATEGORY_MIN_TOP_SCORE = 0.5   # if top score is below this, text is too vague — just take top 1
 
-# Pre-encode category label embeddings once at startup
 CATEGORY_EMBS = category_model.encode(CATEGORY_LABELS, convert_to_tensor=True)
 
-# Question words that suggest a general query
 QUESTION_WORDS = ["how to", "how do", "what is", "what are", "what's",
                   "can you tell", "can you please tell", "could you tell",
                   "please tell", "please let me know", "please explain",
@@ -486,48 +368,26 @@ QUESTION_WORDS = ["how to", "how do", "what is", "what are", "what's",
                   "would you", "is there", "are there", "do you know",
                   "when is", "when will", "when can"]
 
-# Problem words that confirm a technical issue
-PROBLEM_WORDS  = ["failed", "error", "not working", "stuck", "issue", "problem",
-                  "crash", "unable", "cannot", "can't", "broken", "wrong",
-                  "incorrect", "missing", "slow", "timeout", "deducted", "not loading"]
+PROBLEM_WORDS = ["failed", "error", "not working", "stuck", "issue", "problem",
+                 "crash", "unable", "cannot", "can't", "broken", "wrong",
+                 "incorrect", "missing", "slow", "timeout", "deducted", "not loading"]
+
 
 def detect_categories(body):
-    """
-    Detects categories using sentence embedding margin-based matching
-    (Approach B from final comparison testing — 88% on 25 realistic
-    short/long/tricky test cases, with focused 1-2 category output
-    in the vast majority of cases).
-
-    1. Pre-check for general queries (question words, no problem words)
-    2. Truncate to first 150 words
-    3. Encode and compare against category label embeddings
-    4. Take the top score; include any category within MARGIN of it
-       (only if top score >= MIN_TOP_SCORE, otherwise just take top 1)
-    Returns comma-separated full category name string.
-
-    Known limitations (documented edge cases from testing):
-    - Pure informational questions containing "loan" (e.g. "what documents
-      are needed for a personal loan?") may be detected as Loan Processing
-      Issues instead of General Query.
-    - "Login to make a payment" style emails may be detected as Payment
-      Processing Issues instead of Access and Login Issues.
-    - App names containing "pay" (e.g. "Paymentor") may bias toward
-      Payment Processing Issues even when the issue is a system/app error.
-    """
+    """Detects one or more issue categories using BGE embeddings + margin-based matching.
+    Runs once at ticket creation, never on replies. Returns a comma-separated string."""
     words = body.strip().split()
     text  = " ".join(words[:150])
     text_lower = text.lower()
 
-    # Pre-check: if question words present and no problem words -> General Query
     has_question = any(q in text_lower for q in QUESTION_WORDS)
     has_problem  = any(p in text_lower for p in PROBLEM_WORDS)
     if has_question and not has_problem:
         return "General Query"
 
     try:
-        emb    = category_model.encode(text, convert_to_tensor=True)
-        scores = st_util.cos_sim(emb, CATEGORY_EMBS)[0].tolist()
-
+        emb       = category_model.encode(text, convert_to_tensor=True)
+        scores    = st_util.cos_sim(emb, CATEGORY_EMBS)[0].tolist()
         score_map = {LABEL_TO_FULL[label]: score for label, score in zip(CATEGORY_LABELS, scores)}
         top_score = max(score_map.values())
 
@@ -536,7 +396,6 @@ def detect_categories(body):
         else:
             cutoff   = top_score - CATEGORY_MARGIN
             detected = [cat for cat, score in score_map.items() if score >= cutoff]
-
     except Exception as e:
         print(f"Category detection error: {e} — defaulting to General Query")
         detected = ["General Query"]
@@ -544,9 +403,8 @@ def detect_categories(body):
     return ", ".join(detected)
 
 
-# ---------------------------------------------------------------------------
 # AI — Due date extraction
-# ---------------------------------------------------------------------------
+
 
 _cal = parsedatetime.Calendar()
 
@@ -577,6 +435,8 @@ def find_deadline_sentence(text, entity_text):
 
 
 def extract_deadline(body):
+    """Extracts a due date from email body using GLiNER. Returns formatted datetime string,
+    'ASAP', 'URGENT', or empty string if nothing found."""
     text       = get_first_300_words(body)
     text_lower = text.lower()
 
@@ -608,75 +468,86 @@ def extract_deadline(body):
     return ""
 
 
+# AI — Status detection helpers
 
-# ---------------------------------------------------------------------------
+
+def strip_quoted_content(body):
+    """Strips quoted/forwarded content from an email, keeping only the new text."""
+    text = body.strip()
+
+    separators = [
+        "________________________________",
+        "-----Original Message-----",
+        "-----Forwarded Message-----",
+        "-------- Original Message --------",
+        "-------------------------",
+    ]
+    for sep in separators:
+        idx = text.find(sep)
+        if idx > 5:
+            text = text[:idx].strip()
+            break
+
+    on_wrote_pattern = re.compile(
+        r'\n?On\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,.*?wrote:',
+        re.IGNORECASE | re.DOTALL
+    )
+    match = on_wrote_pattern.search(text)
+    if match and match.start() > 5:
+        text = text[:match.start()].strip()
+
+    lines = text.split("\n")
+    text = "\n".join(line for line in lines if not line.strip().startswith(">")).strip()
+
+    text = re.sub(r'CAUTION:.*?safe\.', '', text, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    return text
+
+
+def get_first_300_words(body):
+    """Returns the first 300 words of the new reply text (quoted content stripped)."""
+    text = strip_quoted_content(body)
+    return " ".join(text.split()[:300])
+
+
 # Assignee name extraction
-# ---------------------------------------------------------------------------
+
 
 def extract_assignee_name(sender_name, sender_email, body):
-    """
-    Extracts the assignee name using three methods in order of preference:
-    1. Sender name from email header (most reliable)
-    2. Clean up email address prefix
-    3. GLiNER scans the first 300 words of body for person names
-    Returns a clean name string or empty string if nothing found.
-    """
-
-    # Method 1 — Sender name from header
+    """Extracts the assignee name. Tries sender name first, then email prefix, then GLiNER."""
     if sender_name and sender_name.strip():
         name = sender_name.strip()
-        # Make sure it looks like a real name not a generic sender
-        # Skip names that look like system senders e.g. "No Reply", "Support Team"
-        skip_keywords = ["noreply", "no-reply", "support", "team", "system",
-                         "notification", "alert", "admin", "info", "do-not-reply"]
-        if not any(kw in name.lower() for kw in skip_keywords):
+        skip = ["noreply", "no-reply", "support", "team", "system",
+                "notification", "alert", "admin", "info", "do-not-reply"]
+        if not any(kw in name.lower() for kw in skip):
             return name
 
-    # Method 2 — Clean up email address
     if sender_email and "@" in sender_email:
         local_part = sender_email.split("@")[0]
-        # Remove common prefixes like ex_, usr_, emp_
         local_part = re.sub(r'^(ex_|usr_|emp_|user_|staff_)', '', local_part, flags=re.IGNORECASE)
-        # Replace dots, underscores, hyphens with spaces
         local_part = re.sub(r'[._-]', ' ', local_part)
-        # Remove numbers
         local_part = re.sub(r'\d+', '', local_part).strip()
         if local_part:
-            # Capitalize each word
             return local_part.title()
 
-    # Method 3 — GLiNER scans body for person names
     if body and body.strip():
-        text = get_first_300_words(body)
         try:
-            entities = deadline_model.predict_entities(text, ["person name"], threshold=0.4)
+            entities = deadline_model.predict_entities(get_first_300_words(body), ["person name"], threshold=0.4)
             if entities:
-                # Take the first detected person name
                 return entities[0]["text"].strip().title()
         except Exception as e:
             print(f"Name extraction error: {e}")
 
     return ""
 
-# ---------------------------------------------------------------------------
+
 # Excel setup and operations
-# ---------------------------------------------------------------------------
+
 
 HEADERS = [
-    "#",
-    "Sender Name",
-    "Sender Email",
-    "Subject",
-    "Category",
-    "Received Date & Time",
-    "Latest Reply Date & Time",
-    "Status",
-    "Ongoing Since",
-    "Assigned To",
-    "Followups",
-    "Due Date",
-    "Body",
-    "Message-ID",
+    "#", "Sender Name", "Sender Email", "Subject", "Category",
+    "Received Date & Time", "Latest Reply Date & Time", "Status",
+    "Ongoing Since", "Assigned To", "Followups", "Due Date", "Body", "Message-ID",
 ]
 
 COL_NUM          = 1
@@ -723,16 +594,16 @@ def init_excel(filepath):
     ws.column_dimensions["B"].width = 22
     ws.column_dimensions["C"].width = 32
     ws.column_dimensions["D"].width = 40
-    ws.column_dimensions["E"].width = 35   # Category
+    ws.column_dimensions["E"].width = 35
     ws.column_dimensions["F"].width = 22
     ws.column_dimensions["G"].width = 22
-    ws.column_dimensions["H"].width = 12   # Status
-    ws.column_dimensions["I"].width = 20   # Ongoing Since
-    ws.column_dimensions["J"].width = 30   # Assigned To
-    ws.column_dimensions["K"].width = 10   # Followups
-    ws.column_dimensions["L"].width = 20   # Due Date
-    ws.column_dimensions["M"].width = 60   # Body
-    ws.column_dimensions["N"].width = 40   # Message-ID
+    ws.column_dimensions["H"].width = 12
+    ws.column_dimensions["I"].width = 20
+    ws.column_dimensions["J"].width = 30
+    ws.column_dimensions["K"].width = 10
+    ws.column_dimensions["L"].width = 20
+    ws.column_dimensions["M"].width = 60
+    ws.column_dimensions["N"].width = 40
     ws.row_dimensions[1].height = 30
 
     wb.save(filepath)
@@ -765,53 +636,37 @@ def get_all_subjects(ws):
 
 
 def find_matching_row(em, ws):
+    """Matches a reply to an existing ticket — first by Message-ID, then by subject."""
     id_to_row  = get_all_message_ids(ws)
     target_row = id_to_row.get(em["in_reply_to"])
     if target_row:
         return target_row, "message-id"
-    subject_to_row   = get_all_subjects(ws)
-    cleaned_incoming = clean_subject(em["subject"])
-    target_row       = subject_to_row.get(cleaned_incoming)
+    subject_to_row = get_all_subjects(ws)
+    target_row     = subject_to_row.get(clean_subject(em["subject"]))
     if target_row:
         return target_row, "subject"
     return None, None
 
 
 def append_new_email(em, filepath):
-    """Adds a new row for a fresh ticket with Status=Pending, Followups=0, and runs AI detection."""
+    """Creates a new ticket row with Status=Pending and runs AI category/due-date detection."""
     try:
         wb       = openpyxl.load_workbook(filepath)
         ws       = wb["Inbox Tracker"]
         next_row = ws.max_row + 1
         index    = next_row - 1
 
-        alt_fill = PatternFill("solid", start_color="DCE6F1")
-        row_fill = alt_fill if index % 2 == 0 else PatternFill()
-
-        print(f"   Running category detection...")
-        category = detect_categories(em["body"])
-        due_date = extract_deadline(em["body"])
-
-        # Use the same timestamped format as replies, so the conversation
-        # log is consistent from the very first entry
+        alt_fill     = PatternFill("solid", start_color="DCE6F1")
+        row_fill     = alt_fill if index % 2 == 0 else PatternFill()
+        category     = detect_categories(em["body"])
+        due_date     = extract_deadline(em["body"])
         clean_body   = strip_quoted_content(em["body"])
         initial_body = f"[{em['received']}] {em['sender_email']}:\n{clean_body}"
 
         values = [
-            index,
-            em["sender_name"],
-            em["sender_email"],
-            em["subject"],
-            category,
-            em["received"],
-            "",           # Latest Reply Date
-            "Pending",
-            "",           # Ongoing Since — blank until status first becomes Ongoing
-            "",           # Assigned To — empty until someone other than sender replies
-            0,            # Followups
-            due_date,
-            initial_body,
-            em["message_id"],
+            index, em["sender_name"], em["sender_email"], em["subject"],
+            category, em["received"], "",
+            "Pending", "", "", 0, due_date, initial_body, em["message_id"],
         ]
 
         for col, value in enumerate(values, start=1):
@@ -830,19 +685,12 @@ def append_new_email(em, filepath):
 
 
 def update_existing_row(em, target_row, filepath):
-    """
-    Updates an existing ticket row based on who replied and current status.
+    """Updates an existing ticket row based on who replied and the current status.
 
-    Logic:
-    - Reply from original sender + Pending  -> increment Followups, keep Pending
-    - Reply from original sender + Ongoing  -> keep Ongoing
-    - Reply from original sender + Resolved -> create NEW row (new issue)
-    - Reply from anyone else                -> AI status check
-
-    Category is NOT re-evaluated on replies — it is set once when the
-    ticket is first created and remains unchanged. Short reply text
-    (acknowledgements, one-liners) does not carry reliable category
-    information and was causing mis-categorization.
+    - Same sender + Pending  -> increment Followups, keep Pending
+    - Same sender + Ongoing  -> keep Ongoing
+    - Same sender + Resolved -> return 'new_issue' (caller creates a new row)
+    - Anyone else replied    -> Gemma checks full conversation -> Resolved or Ongoing
     """
     try:
         wb = openpyxl.load_workbook(filepath)
@@ -854,60 +702,44 @@ def update_existing_row(em, target_row, filepath):
         is_same_sender  = (reply_sender == original_sender)
 
         if is_same_sender and current_status == "Resolved":
-            # New issue raised after resolution — handled by process_email, not here
             return "new_issue"
 
-        # Category is set once at ticket creation and not re-evaluated here
-        due_date = extract_deadline(em["body"])
-
-        # Strip quoted/forwarded content from the new reply so we only
-        # store the new text the sender actually wrote, then build the
-        # updated conversation log (newest entry on top). This is needed
-        # up front since the Gemma resolution check below requires the
-        # FULL conversation, not just the latest message.
+        due_date      = extract_deadline(em["body"])
         existing_body = ws.cell(row=target_row, column=COL_BODY).value or ""
         clean_reply   = strip_quoted_content(em["body"])
         new_entry     = f"[{em['received']}] {em['sender_email']}:\n{clean_reply}"
         combined_body = f"{new_entry}\n\n---\n\n{existing_body}" if existing_body else new_entry
 
         if is_same_sender and current_status == "Pending":
-            # Sender following up — increment Followups, keep Pending
             current_followups = ws.cell(row=target_row, column=COL_FOLLOWUPS).value or 0
             new_followups     = int(current_followups) + 1
             ws.cell(row=target_row, column=COL_FOLLOWUPS).value     = new_followups
             ws.cell(row=target_row, column=COL_FOLLOWUPS).alignment = Alignment(horizontal="center", vertical="top")
             status = "Pending"
-            print(f"   Ticket raiser following up — status stays Pending, followups now {new_followups}")
+            print(f"   Sender following up — Pending, followups now {new_followups}")
 
         elif is_same_sender and current_status == "Ongoing":
-            # Sender adding info while TechOps is working — keep Ongoing
             status = "Ongoing"
-            print(f"   Sender adding info — status stays Ongoing")
+            print(f"   Sender adding info — stays Ongoing")
 
         else:
-            # Someone else replied — ask Gemma whether ALL questions/issues
-            # raised by the original sender have been answered across the
-            # FULL conversation (handles multi-turn Q&A tickets where each
-            # question is answered in a separate reply).
-            print(f"   Reply from someone else — running conversational resolution check...")
+            print(f"   Reply from someone else — running resolution check...")
             resolved = is_conversation_resolved(combined_body, original_sender)
             status   = "Resolved" if resolved else "Ongoing"
-        combined_body = combined_body[:10000]  # Cap total length to keep file manageable
 
-        ws.cell(row=target_row, column=COL_BODY).value          = combined_body
-        ws.cell(row=target_row, column=COL_BODY).alignment      = Alignment(vertical="top", wrap_text=True)
-        ws.cell(row=target_row, column=COL_LATEST_DATE).value   = em["received"]
+        combined_body = combined_body[:10000]
+
+        ws.cell(row=target_row, column=COL_BODY).value            = combined_body
+        ws.cell(row=target_row, column=COL_BODY).alignment        = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row=target_row, column=COL_LATEST_DATE).value     = em["received"]
         ws.cell(row=target_row, column=COL_LATEST_DATE).alignment = Alignment(vertical="top")
+
         status_cell = ws.cell(row=target_row, column=COL_STATUS, value=status)
         apply_status_color(status_cell, status)
 
-        # Record when the ticket first became Ongoing — used for the
-        # "days in Ongoing" dashboard list. Only set the very first time
-        # status transitions into Ongoing; later Ongoing->Ongoing updates
-        # (e.g. sender adding more info) must not reset this timestamp.
+        # Record when the ticket first became Ongoing (never overwrite once set)
         if status == "Ongoing" and current_status != "Ongoing":
-            existing_ongoing_since = ws.cell(row=target_row, column=COL_ONGOING_SINCE).value
-            if not existing_ongoing_since:
+            if not ws.cell(row=target_row, column=COL_ONGOING_SINCE).value:
                 ws.cell(row=target_row, column=COL_ONGOING_SINCE).value     = em["received"]
                 ws.cell(row=target_row, column=COL_ONGOING_SINCE).alignment = Alignment(vertical="top")
 
@@ -915,7 +747,6 @@ def update_existing_row(em, target_row, filepath):
             ws.cell(row=target_row, column=COL_DUE_DATE).value     = due_date
             ws.cell(row=target_row, column=COL_DUE_DATE).alignment = Alignment(vertical="top")
 
-        # Update Assigned To — only when reply is NOT from original sender
         if not is_same_sender:
             assignee = extract_assignee_name(em["sender_name"], em["sender_email"], em["body"])
             if assignee:
@@ -933,11 +764,11 @@ def update_existing_row(em, target_row, filepath):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Deciding what to do with each incoming email
-# ---------------------------------------------------------------------------
+# Email routing
+
 
 def process_email(em, retry_queue, filepath):
+    """Routes an incoming email to either update an existing ticket or create a new one."""
     if em["in_reply_to"]:
         wb         = openpyxl.load_workbook(filepath)
         ws         = wb["Inbox Tracker"]
@@ -945,59 +776,37 @@ def process_email(em, retry_queue, filepath):
 
         if target_row:
             result = update_existing_row(em, target_row, filepath)
-
             if result == "new_issue":
-                # Original sender raised a new issue after resolution — new row
-                print(f"New issue raised after resolution — creating new ticket.")
+                print(f"New issue after resolution — creating new ticket.")
                 saved = append_new_email(em, filepath)
-                if saved:
-                    print(f"New ticket saved")
-                else:
+                if not saved:
                     retry_queue.append(em)
-                    print(f"Excel is open — queued for retry.")
-                print(f"   From    : {em['sender_name']} <{em['sender_email']}>")
-                print(f"   Subject : {em['subject']}")
-                print(f"   Time    : {em['received']}\n")
-
+                    print(f"   Excel open — queued.")
             elif result is True:
                 print(f"Reply received — ticket updated (matched by {match_type})")
                 print(f"   Subject    : {em['subject']}")
                 print(f"   Replied at : {em['received']}\n")
-
             else:
                 retry_queue.append(em)
-                print(f"Excel is open — reply queued: '{em['subject']}'\n")
-
+                print(f"Excel open — reply queued: '{em['subject']}'\n")
         else:
-            print(f"Got a reply but couldn't find the original ticket, saving as new.")
+            print(f"Reply with no matching ticket — saving as new.")
             saved = append_new_email(em, filepath)
             if not saved:
                 retry_queue.append(em)
-                print(f"   Excel is open — will retry when it's closed.\n")
-
     else:
         saved = append_new_email(em, filepath)
-        if saved:
-            print(f"New ticket saved")
-        else:
+        if not saved:
             retry_queue.append(em)
-            print(f"New ticket received but Excel is open — added to queue.")
-        print(f"   From    : {em['sender_name']} <{em['sender_email']}>")
-        print(f"   Subject : {em['subject']}")
-        print(f"   Time    : {em['received']}\n")
+            print(f"Excel open — new ticket queued.")
+        print(f"{'New ticket saved' if saved else 'Queued'}: '{em['subject']}' from {em['sender_email']}\n")
 
 
+# Outlook connection helpers
 
-# ---------------------------------------------------------------------------
-# Outlook connection helpers (replaces IMAP connection helpers)
-# ---------------------------------------------------------------------------
 
 def connect_outlook():
-    """
-    Connects to the running (or starts a new) Outlook session via COM and
-    returns the Inbox folder. No credentials needed — uses whichever
-    account is already signed into the Outlook desktop app.
-    """
+    """Connects to the already-running Outlook session via COM. No credentials needed."""
     outlook   = win32com.client.Dispatch("Outlook.Application")
     namespace = outlook.GetNamespace("MAPI")
     inbox     = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
@@ -1005,12 +814,9 @@ def connect_outlook():
 
 
 def get_inbox_entry_ids(inbox):
-    """
-    Returns the set of EntryIDs for all mail items currently in the inbox.
-    Equivalent to safe_get_ids() in the IMAP version.
-    """
+    """Returns the set of EntryIDs for all mail items in the inbox."""
     try:
-        ids = set()
+        ids   = set()
         items = inbox.Items
         for item in items:
             try:
@@ -1025,10 +831,7 @@ def get_inbox_entry_ids(inbox):
 
 
 def fetch_item_by_entry_id(namespace, entry_id):
-    """
-    Fetches a single mail item by EntryID and parses it.
-    Equivalent to safe_fetch_email() in the IMAP version.
-    """
+    """Fetches and parses a single mail item by EntryID."""
     try:
         item = namespace.GetItemFromID(entry_id)
         if item.Class == OL_MAIL_ITEM:
@@ -1039,23 +842,17 @@ def fetch_item_by_entry_id(namespace, entry_id):
 
 
 def fetch_items_since(inbox, since_dt):
-    """
-    Fetches all mail items received after since_dt from the inbox.
-    Returns list of (entry_id, parsed_email) tuples sorted oldest first,
-    with non-reply items before reply items (same ordering logic as the
-    IMAP version's safe_fetch_emails_since(), to ensure original tickets
-    are processed before their replies during historical load).
-    """
+    """Fetches all mail items received after since_dt, sorted oldest-first with
+    original tickets before replies (prevents reply-before-ticket race conditions)."""
     results = []
     try:
         items = inbox.Items
-        items.Sort("[ReceivedTime]", False)  # ascending — oldest first
-        # Restrict to items received after since_dt for efficiency
+        items.Sort("[ReceivedTime]", False)
         restrict_str = since_dt.strftime("[ReceivedTime] > '%m/%d/%Y %H:%M %p'")
         try:
             filtered = items.Restrict(restrict_str)
         except Exception:
-            filtered = items  # fall back to scanning everything
+            filtered = items
 
         for item in filtered:
             try:
@@ -1074,42 +871,28 @@ def fetch_items_since(inbox, since_dt):
         print(f"Could not fetch historical emails: {e}")
         return []
 
-    # Sort strictly oldest first by received datetime
     results.sort(key=lambda x: x[2])
-
-    # Originals before replies (same fix as the IMAP version — handles
-    # same-minute timestamp ties between an original and its reply)
     no_reply  = [(eid, em, dt) for eid, em, dt in results if not em["in_reply_to"]]
     has_reply = [(eid, em, dt) for eid, em, dt in results if em["in_reply_to"]]
     no_reply.sort(key=lambda x: x[2])
     has_reply.sort(key=lambda x: x[2])
-    results = no_reply + has_reply
-
-    return [(eid, em) for eid, em, _ in results]
+    return [(eid, em) for eid, em, _ in no_reply + has_reply]
 
 
-# ---------------------------------------------------------------------------
-# Historical load (Outlook COM version)
-# ---------------------------------------------------------------------------
+# Historical load
+
 
 def get_last_record_time(filepath):
-    """
-    Scans all rows in Excel and returns the latest timestamp across
-    both Received Date and Latest Reply Date columns.
-    Returns None if file does not exist or has no data rows.
-    """
+    """Returns the latest timestamp in the Excel file, or None if empty/missing."""
     if not os.path.exists(filepath):
         return None
-
     try:
         wb = openpyxl.load_workbook(filepath)
         ws = wb["Inbox Tracker"]
-
         if ws.max_row <= 1:
-            return None  # Only header row — treat as empty
+            return None
 
         latest_dt = None
-
         for row in range(2, ws.max_row + 1):
             for col in [COL_RECEIVED, COL_LATEST_DATE]:
                 val = ws.cell(row=row, column=col).value
@@ -1121,29 +904,22 @@ def get_last_record_time(filepath):
                         latest_dt = dt
                 except Exception:
                     continue
-
         return latest_dt
-
     except Exception as e:
         print(f"Could not read last record time: {e}")
         return None
 
 
 def load_historical_emails_com(inbox, allowed_senders, retry_queue):
-    """
-    Loads historical emails based on Excel state:
-    - No file or empty  -> fetch last 24 hours
-    - Has data          -> fetch from last record timestamp to now
-    Processes them oldest first so replies link to their original tickets.
-    """
+    """Loads emails since the last recorded timestamp (or last 24hrs if the file is empty)."""
     last_time = get_last_record_time(OUTPUT_FILE)
 
     if last_time is None:
         since_dt = datetime.now() - timedelta(hours=24)
-        print(f"No existing data — loading emails from last 24 hours ({since_dt.strftime('%Y-%m-%d %H:%M:%S')} to now)...")
+        print(f"No existing data — loading emails from last 24 hours ({since_dt.strftime('%Y-%m-%d %H:%M:%S')})...")
     else:
         since_dt = last_time
-        print(f"Existing data found — loading emails since last record ({since_dt.strftime('%Y-%m-%d %H:%M:%S')})...")
+        print(f"Existing data found — loading since {since_dt.strftime('%Y-%m-%d %H:%M:%S')}...")
 
     emails = fetch_items_since(inbox, since_dt)
 
@@ -1151,45 +927,27 @@ def load_historical_emails_com(inbox, allowed_senders, retry_queue):
         print("No new historical emails to load.")
         return allowed_senders
 
-    print(f"Found {len(emails)} historical email(s) to process. Processing oldest first...")
+    print(f"Found {len(emails)} historical email(s). Processing oldest first...")
     print()
 
     for i, (eid, em) in enumerate(emails, 1):
-        print(f"[{i}/{len(emails)}] Processing: '{em['subject']}' from {em['sender_email']}")
+        print(f"[{i}/{len(emails)}] {em['subject']} — from {em['sender_email']}")
         if not is_allowed(em["sender_email"], allowed_senders):
             print(f"   Ignored (not in allowed list)")
             continue
         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
         process_email(em, retry_queue, OUTPUT_FILE)
 
-    print(f"Historical load complete — {len(emails)} email(s) processed.")
-    print()
+    print(f"Historical load complete — {len(emails)} email(s) processed.\n")
     return allowed_senders
 
 
-# ---------------------------------------------------------------------------
-# Due date check — runs every poll cycle
-# ---------------------------------------------------------------------------
-
 def check_due_date_and_resolve(filepath):
-    """
-    Due dates are purely informational (displayed in the Due Date column
-    for reference) and do NOT drive status changes. Per direction from
-    the supervisor: a ticket whose due date has passed should simply
-    remain at whatever status it already has (e.g. stay Ongoing) — no
-    automatic Overdue status and no auto-resolving. This function is
-    kept as a no-op placeholder in case due-date-driven behavior is
-    wanted again in the future, and so the call site in the polling
-    loop doesn't need to change.
-    """
     pass
 
 
-# ---------------------------------------------------------------------------
-# Dashboard generation — Python-computed snapshot (run once/twice a day,
-# after the latest batch of emails has been processed). All values and
-# charts are static at generation time; re-run the script to refresh.
-# ---------------------------------------------------------------------------
+# Dashboard generation
+
 
 DASH_SHEET          = "Dashboard"
 DASH_STATUSES       = ["Pending", "Ongoing", "Resolved"]
@@ -1203,22 +961,12 @@ DASH_LABEL_FONT        = Font(bold=True, size=10, name="Arial")
 DASH_VALUE_FONT        = Font(size=10, name="Arial")
 DASH_TABLE_HEADER_FONT = Font(bold=True, size=10, name="Arial", color="FFFFFF")
 DASH_TABLE_HEADER_FILL = PatternFill("solid", start_color="44546A")
-DASH_URGENT_FILL       = PatternFill("solid", start_color="FCE4D6")  # long-running Ongoing tickets
+DASH_URGENT_FILL       = PatternFill("solid", start_color="FCE4D6")
 
 
 def _dash_set_title(title_holder, size_pt=14, bold=True, color="1F1F1F"):
-    """
-    Applies an explicit font size and overlay=False to a chart's or
-    axis's EXISTING title (set beforehand via chart.title = "..." or
-    axis.title = "..."). Modifies the existing paragraph/run in place
-    rather than replacing it, so the original title text is preserved.
-
-    Newer openpyxl versions (3.1.4+) leave title font size at a tiny
-    default and don't explicitly set overlay=False, which makes real
-    Excel render titles too small and stacked on top of the chart /
-    axis tick labels instead of placed above/beside them (other
-    renderers like LibreOffice are more forgiving and hide this bug).
-    """
+    """Sets explicit font size and overlay=False on a chart/axis title.
+    Required for openpyxl 3.1.4+ where titles are tiny and overlapping in real Excel."""
     if title_holder.title is None or title_holder.title.tx is None:
         return
     para = title_holder.title.tx.rich.p[0]
@@ -1250,7 +998,6 @@ def _dash_parse_dt(value, fmt="%Y-%m-%d %H:%M:%S"):
 
 
 def _dash_read_tickets(data_ws):
-    """Reads all data rows into a list of dicts for easy aggregation."""
     tickets = []
     for row in range(2, data_ws.max_row + 1):
         num = data_ws.cell(row=row, column=COL_NUM).value
@@ -1279,52 +1026,33 @@ def _dash_status_counts(tickets):
 
 
 def _dash_category_breakdown(tickets, categories):
-    """
-    For each category, counts how many tickets are Pending and how many
-    are Ongoing. A ticket with multiple comma-separated categories counts
-    toward EACH of its categories (matches how detect_categories() stores
-    multi-label results). Returns {category: {"Pending": n, "Ongoing": n}}.
-    """
+    """Counts Pending/Ongoing tickets per category. Multi-label tickets count toward each category."""
     breakdown = {cat: {"Pending": 0, "Ongoing": 0} for cat in categories}
     for t in tickets:
         if t["status"] not in ("Pending", "Ongoing"):
             continue
-        raw_cats = [c.strip() for c in (t["category"] or "").split(",") if c.strip()]
-        for cat in raw_cats:
+        for cat in [c.strip() for c in (t["category"] or "").split(",") if c.strip()]:
             if cat in breakdown:
                 breakdown[cat][t["status"]] += 1
     return breakdown
 
 
 def _dash_assignee_breakdown(tickets):
-    """
-    For each assignee, counts Pending and Ongoing tickets. A ticket can
-    have multiple comma-separated assignees (credited to each). Tickets
-    with no assignee are grouped under "Unassigned". Returns a dict
-    sorted by total (Pending+Ongoing) descending, capped at the top 12
-    to keep the chart readable.
-    """
+    """Counts Pending/Ongoing tickets per assignee. Multi-assignee tickets count toward each.
+    Returns top 12 by total, with unassigned tickets grouped under 'Unassigned'."""
     breakdown = defaultdict(lambda: {"Pending": 0, "Ongoing": 0})
     for t in tickets:
         if t["status"] not in ("Pending", "Ongoing"):
             continue
-        raw_names = [a.strip() for a in (t["assigned_to"] or "").split(",") if a.strip()]
-        if not raw_names:
-            raw_names = ["Unassigned"]
-        for name in raw_names:
+        names = [a.strip() for a in (t["assigned_to"] or "").split(",") if a.strip()] or ["Unassigned"]
+        for name in names:
             breakdown[name][t["status"]] += 1
-
     sorted_items = sorted(breakdown.items(), key=lambda kv: -(kv[1]["Pending"] + kv[1]["Ongoing"]))
     return dict(sorted_items[:12])
 
 
 def _dash_ongoing_list(tickets, now):
-    """
-    Returns Ongoing tickets sorted by days-in-Ongoing descending (whole
-    days, computed from the Ongoing Since timestamp to now). Tickets
-    missing Ongoing Since (shouldn't normally happen for an Ongoing
-    ticket, but handled defensively) are treated as 0 days.
-    """
+    """Returns Ongoing tickets sorted by days-in-Ongoing descending."""
     ongoing = [t for t in tickets if t["status"] == "Ongoing"]
     enriched = []
     for t in ongoing:
@@ -1336,19 +1064,9 @@ def _dash_ongoing_list(tickets, now):
 
 
 def update_dashboard(filepath):
-    """
-    Rebuilds the 'Dashboard' sheet as a static snapshot of the current
-    'Inbox Tracker' data: overview counts, a status pie chart, grouped
-    Pending/Ongoing bar charts by category and by assignee, and a list
-    of all Ongoing tickets sorted by how many days they've been Ongoing
-    (rows ongoing 14+ days are highlighted). Meant to be run once or
-    twice a day, not on every poll cycle — everything here is computed
-    fresh from scratch each call, so it's always consistent with
-    whatever is in the data sheet at the time it's run.
-
-    Returns True on success, False if the file is locked (e.g. open in
-    Excel) or the data sheet is missing.
-    """
+    """Rebuilds the Dashboard sheet as a static snapshot: overview counts, status pie chart,
+    category and assignee bar charts, and a list of Ongoing tickets sorted by days open.
+    Called automatically whenever new data is processed. Returns True on success."""
     try:
         wb = openpyxl.load_workbook(filepath)
     except PermissionError:
@@ -1371,46 +1089,36 @@ def update_dashboard(filepath):
         del wb[DASH_SHEET]
     ws = wb.create_sheet(DASH_SHEET, 0)
     ws.sheet_view.showGridLines = False
-
-    # Landscape + fit-to-width so printing/exporting to PDF doesn't cut
-    # off columns — purely a print/export concern, doesn't affect the
-    # normal on-screen Excel view.
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    status_counts      = _dash_status_counts(tickets)
-    cat_breakdown       = _dash_category_breakdown(tickets, categories)
-    assignee_breakdown  = _dash_assignee_breakdown(tickets)
-    ongoing_list        = _dash_ongoing_list(tickets, now)
+    status_counts     = _dash_status_counts(tickets)
+    cat_breakdown      = _dash_category_breakdown(tickets, categories)
+    assignee_breakdown = _dash_assignee_breakdown(tickets)
+    ongoing_list       = _dash_ongoing_list(tickets, now)
 
-    total = len(tickets)
+    total           = len(tickets)
     resolution_rate = (status_counts["Resolved"] / total) if total else 0
     avg_followups   = (sum(t["followups"] for t in tickets) / total) if total else 0
 
-    # -------------------------------------------------------------
-    # Title
-    # -------------------------------------------------------------
     ws["B2"] = "TechOps Ticket Dashboard"
     ws["B2"].font = DASH_TITLE_FONT
     ws["B3"] = f"Generated: {now.strftime('%Y-%m-%d %H:%M')}"
     ws["B3"].font = DASH_SUBTITLE_FONT
 
-    # -------------------------------------------------------------
-    # Section 1: Overview counts
-    # -------------------------------------------------------------
+    # Section 1: Overview
     row = 5
     row = _dash_section_header(ws, row, "Overview")
-    items = [
+    for label, value, numfmt in [
         ("Total Tickets", total, None),
         ("Pending", status_counts["Pending"], None),
         ("Ongoing", status_counts["Ongoing"], None),
         ("Resolved", status_counts["Resolved"], None),
         ("Resolution Rate", resolution_rate, "0.0%"),
         ("Avg Followups / Ticket", avg_followups, "0.00"),
-    ]
-    for label, value, numfmt in items:
+    ]:
         ws.cell(row=row, column=2, value=label).font = DASH_LABEL_FONT
         c = ws.cell(row=row, column=4, value=value)
         c.font = DASH_VALUE_FONT
@@ -1419,10 +1127,7 @@ def update_dashboard(filepath):
         row += 1
     row += 1
 
-    # -------------------------------------------------------------
-    # Section 2: Status pie chart — chart on the left (the main thing
-    # to glance at), small data table to its right for exact numbers.
-    # -------------------------------------------------------------
+    # Section 2: Status pie chart — chart left, table right
     row = _dash_section_header(ws, row, "Status Breakdown")
     status_table_row = row
     ws.cell(row=row, column=6, value="Status").font = DASH_LABEL_FONT
@@ -1436,10 +1141,8 @@ def update_dashboard(filepath):
 
     pie = PieChart()
     pie.title = "Tickets by Status"
-    data_ref = Reference(ws, min_col=7, min_row=status_table_row, max_row=status_table_end)
-    cats_ref = Reference(ws, min_col=6, min_row=status_table_row + 1, max_row=status_table_end)
-    pie.add_data(data_ref, titles_from_data=True)
-    pie.set_categories(cats_ref)
+    pie.add_data(Reference(ws, min_col=7, min_row=status_table_row, max_row=status_table_end), titles_from_data=True)
+    pie.set_categories(Reference(ws, min_col=6, min_row=status_table_row + 1, max_row=status_table_end))
     pie.height = 7.5
     pie.width = 11
     pie.dataLabels = DataLabelList()
@@ -1450,15 +1153,9 @@ def update_dashboard(filepath):
     pie.dataLabels.showSerName = False
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{status_table_row}")
-
     row = max(row, status_table_row + 16) + 1
 
-    # -------------------------------------------------------------
-        # -------------------------------------------------------------
-    # Section 3: Category breakdown — grouped bar chart (Pending/Ongoing).
-    # Chart on the left, data table further right (this chart is wider
-    # than the pie chart, so the table needs to start further over).
-    # -------------------------------------------------------------
+    # Section 3: Category bar chart — chart left, table right
     row = _dash_section_header(ws, row, "Tickets by Category (Pending vs Ongoing)")
     cat_table_row = row
     ws.cell(row=row, column=10, value="Category").font = DASH_LABEL_FONT
@@ -1477,32 +1174,21 @@ def update_dashboard(filepath):
     cat_bar.grouping = "clustered"
     cat_bar.title = "Tickets by Category"
     cat_bar.y_axis.title = "Number of Tickets"
-    data_ref = Reference(ws, min_col=11, max_col=12, min_row=cat_table_row, max_row=cat_table_end)
-    cats_ref = Reference(ws, min_col=10, min_row=cat_table_row + 1, max_row=cat_table_end)
-    cat_bar.add_data(data_ref, titles_from_data=True)
-    cat_bar.set_categories(cats_ref)
+    cat_bar.add_data(Reference(ws, min_col=11, max_col=12, min_row=cat_table_row, max_row=cat_table_end), titles_from_data=True)
+    cat_bar.set_categories(Reference(ws, min_col=10, min_row=cat_table_row + 1, max_row=cat_table_end))
     cat_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
     cat_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
     cat_bar.height = 9
     cat_bar.width = 20
     cat_bar.x_axis.textRotation = -30
+    cat_bar.x_axis.delete = False  # openpyxl 3.1.4+ bug: axes hidden in Excel unless explicitly set
+    cat_bar.y_axis.delete = False
     _dash_set_title(cat_bar, size_pt=14)
     _dash_set_title(cat_bar.y_axis, size_pt=10)
-    # openpyxl 3.1.4+ leaves axes implicitly "deleted" in the chart XML
-    # unless explicitly told otherwise, which makes real Excel hide both
-    # axis lines AND their labels entirely (other renderers like
-    # LibreOffice/VS Code's preview show them anyway, masking the bug).
-    cat_bar.x_axis.delete = False
-    cat_bar.y_axis.delete = False
     ws.add_chart(cat_bar, f"B{cat_table_row}")
-
     row = max(row, cat_table_row + 19) + 1
 
-    # -------------------------------------------------------------
-        # -------------------------------------------------------------
-    # Section 4: Assignee breakdown — grouped bar chart (Pending/Ongoing).
-    # Chart on the left, data table further right.
-    # -------------------------------------------------------------
+    # Section 4: Assignee bar chart — chart left, table right
     row = _dash_section_header(ws, row, "Tickets by Assignee (Pending vs Ongoing)")
     assignee_table_row = row
     ws.cell(row=row, column=10, value="Assignee").font = DASH_LABEL_FONT
@@ -1521,10 +1207,8 @@ def update_dashboard(filepath):
     assignee_bar.grouping = "clustered"
     assignee_bar.title = "Tickets by Assignee"
     assignee_bar.y_axis.title = "Number of Tickets"
-    data_ref = Reference(ws, min_col=11, max_col=12, min_row=assignee_table_row, max_row=assignee_table_end)
-    cats_ref = Reference(ws, min_col=10, min_row=assignee_table_row + 1, max_row=assignee_table_end)
-    assignee_bar.add_data(data_ref, titles_from_data=True)
-    assignee_bar.set_categories(cats_ref)
+    assignee_bar.add_data(Reference(ws, min_col=11, max_col=12, min_row=assignee_table_row, max_row=assignee_table_end), titles_from_data=True)
+    assignee_bar.set_categories(Reference(ws, min_col=10, min_row=assignee_table_row + 1, max_row=assignee_table_end))
     assignee_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
     assignee_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
     assignee_bar.height = 9
@@ -1535,23 +1219,19 @@ def update_dashboard(filepath):
     _dash_set_title(assignee_bar, size_pt=14)
     _dash_set_title(assignee_bar.y_axis, size_pt=10)
     ws.add_chart(assignee_bar, f"B{assignee_table_row}")
-
     row = max(row, assignee_table_row + 19) + 1
 
-    # -------------------------------------------------------------
-    # Section 5: Ongoing tickets list, sorted by days-in-Ongoing desc
-    # -------------------------------------------------------------
+    # Section 5: Ongoing tickets list sorted by days open
     row = _dash_section_header(ws, row, f"Ongoing Tickets ({len(ongoing_list)}) — Sorted by Days Ongoing", span=7)
     list_header_row = row
-    list_headers = ["Ticket #", "Subject", "Assignee", "Category", "Days Ongoing", "Sender"]
-    for i, h in enumerate(list_headers):
+    for i, h in enumerate(["Ticket #", "Subject", "Assignee", "Category", "Days Ongoing", "Sender"]):
         c = ws.cell(row=row, column=2 + i, value=h)
         c.font = DASH_TABLE_HEADER_FONT
         c.fill = DASH_TABLE_HEADER_FILL
         c.alignment = Alignment(horizontal="center", vertical="center")
     row += 1
 
-    thin = Side(style="thin", color="D9D9D9")
+    thin   = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     if not ongoing_list:
@@ -1559,26 +1239,21 @@ def update_dashboard(filepath):
         row += 1
     else:
         for t in ongoing_list:
-            values = [t["num"], t["subject"], t["assigned_to"] or "Unassigned",
-                      t["category"], t["days_ongoing"], t["sender_email"]]
+            values       = [t["num"], t["subject"], t["assigned_to"] or "Unassigned",
+                            t["category"], t["days_ongoing"], t["sender_email"]]
             long_ongoing = t["days_ongoing"] >= 14
-            row_fill = DASH_URGENT_FILL if long_ongoing else PatternFill()
+            row_fill     = DASH_URGENT_FILL if long_ongoing else PatternFill()
             for col_offset, val in enumerate(values):
                 c = ws.cell(row=row, column=2 + col_offset, value=val)
-                c.font = Font(name="Arial", size=10, bold=long_ongoing)
-                c.fill = row_fill
+                c.font   = Font(name="Arial", size=10, bold=long_ongoing)
+                c.fill   = row_fill
                 c.border = border
-                if col_offset in (0, 4):  # Ticket # and Days Ongoing read better centered
+                if col_offset in (0, 4):
                     c.alignment = Alignment(horizontal="center", vertical="top")
                 else:
                     c.alignment = Alignment(vertical="top", wrap_text=(col_offset == 1))
             row += 1
 
-    # Column widths — shared across all sections on this sheet. B-G serve
-    # the Overview section, the Status table (F/G), and the Ongoing
-    # Tickets list (which needs the most width, for subjects/emails).
-    # H is left at default width as a visual buffer so the Category/
-    # Assignee tables (J/K) don't crowd the wider bar charts next to them.
     ws.column_dimensions["A"].width = 2
     ws.column_dimensions["B"].width = 30
     ws.column_dimensions["C"].width = 38
@@ -1590,10 +1265,7 @@ def update_dashboard(filepath):
     ws.column_dimensions["K"].width = 10
     ws.column_dimensions["L"].width = 10
 
-    # Inserting the Dashboard sheet at index 0 makes it the active sheet
-    # by default — explicitly restore "Inbox Tracker" as active so the
-    # file always opens on the data sheet, and so nothing downstream
-    # that might rely on wb.active gets the wrong sheet.
+    # Restore Inbox Tracker as active sheet so the file opens on the data sheet
     wb.active = wb.sheetnames.index("Inbox Tracker")
 
     try:
@@ -1605,23 +1277,18 @@ def update_dashboard(filepath):
     return True
 
 
-# ---------------------------------------------------------------------------
 # Main listener loop
-# ---------------------------------------------------------------------------
+
 
 def listen():
-    print("\nConnecting to Outlook (Classic) desktop app...")
-
-    # pythoncom.CoInitialize() is needed when COM is used from a thread
-    # other than the one that created it. We're single-threaded here, but
-    # calling it is harmless and protects against future changes.
+    print("\nConnecting to Outlook...")
     pythoncom.CoInitialize()
 
     try:
         namespace, inbox = connect_outlook()
     except Exception as e:
         print(f"Could not connect to Outlook: {e}")
-        print("Make sure Outlook (Classic) is installed and you are signed in.")
+        print("Make sure Outlook (Classic) is open and signed in.")
         return
 
     known_ids       = get_inbox_entry_ids(inbox)
@@ -1630,30 +1297,29 @@ def listen():
     allowed_senders = load_allowed_senders()
 
     if known_ids is None:
-        print("Could not connect. Please check that Outlook is running and signed in.")
+        print("Could not read inbox. Please check Outlook is running.")
         return
 
     print(f"Connected. {len(known_ids)} existing email(s) in inbox will be ignored.")
     print(f"Loaded {len(allowed_senders)} allowed sender(s).")
 
-    # Snapshot known_ids BEFORE historical load so any emails that arrive
-    # during historical processing are caught in the first live poll cycle
-    print("Checking for historical emails to load...")
+    print("Checking for historical emails...")
     allowed_senders = load_historical_emails_com(inbox, allowed_senders, retry_queue)
 
     print("Updating dashboard...")
     if update_dashboard(OUTPUT_FILE):
         print("Dashboard updated.\n")
     else:
-        print("Could not update dashboard right now — you can re-run the script later to refresh it.\n")
+        print("Could not update dashboard right now.\n")
 
-    print(f"Starting live listener — checking every {POLL_INTERVAL} seconds. Press Ctrl+C to stop.\n")
+    print(f"Listening — checking every {POLL_INTERVAL}s. Press Ctrl+C to stop.\n")
 
     while True:
         try:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
 
+            # Retry any emails that failed because Excel was open
             if retry_queue:
                 still_failed = []
                 for em in retry_queue:
@@ -1687,17 +1353,15 @@ def listen():
                             still_failed.append(em)
                 retry_queue = still_failed
                 if retry_queue:
-                    print(f"Excel is still open — {len(retry_queue)} email(s) still waiting.")
+                    print(f"Excel still open — {len(retry_queue)} email(s) waiting.")
                 else:
-                    # All queued emails saved — refresh dashboard
                     update_dashboard(OUTPUT_FILE)
 
             check_due_date_and_resolve(OUTPUT_FILE)
 
             current_ids = get_inbox_entry_ids(inbox)
-
             if current_ids is None:
-                print(f"Could not reach Outlook this cycle, will try again in {POLL_INTERVAL}s...")
+                print(f"Could not reach Outlook this cycle — retrying in {POLL_INTERVAL}s...")
                 continue
 
             new_ids = current_ids - known_ids
@@ -1707,41 +1371,33 @@ def listen():
                     em = fetch_item_by_entry_id(namespace, eid)
                     if em:
                         if not is_allowed(em["sender_email"], allowed_senders):
-                            print(f"Ignored email from {em['sender_email']} (not in allowed list)")
+                            print(f"Ignored: {em['sender_email']} (not in allowed list)")
                             continue
                         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
                         process_email(em, retry_queue, OUTPUT_FILE)
                 known_ids = current_ids
-                # Refresh dashboard now that new data has been processed —
-                # only called once per poll cycle even if multiple emails
-                # arrived, to avoid redundant rebuilds.
                 update_dashboard(OUTPUT_FILE)
-
             else:
                 if poll_count % 4 == 0:
-                    queued_note = f"  ({len(retry_queue)} emails queued)" if retry_queue else ""
+                    queued_note = f"  ({len(retry_queue)} queued)" if retry_queue else ""
                     print(f"Listening...  {datetime.now().strftime('%H:%M:%S')}{queued_note}")
 
         except KeyboardInterrupt:
             if retry_queue:
-                print(f"\nNote: {len(retry_queue)} email(s) were never saved because Excel was open:")
+                print(f"\nNote: {len(retry_queue)} email(s) unsaved (Excel was open):")
                 for em in retry_queue:
                     print(f"   - '{em['subject']}' from {em['sender_email']}")
-            print("\nUpdating dashboard one last time before stopping...")
+            print("\nUpdating dashboard before stopping...")
             if update_dashboard(OUTPUT_FILE):
                 print("Dashboard updated.")
             else:
-                print("Could not update dashboard — you can re-run the script later to refresh it.")
+                print("Could not update dashboard.")
             print("Stopped.")
             break
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main():
-    print("Outlook (Classic) Mail Listener\n")
+    print("TechOps Mail Tracker — Office Laptop (Outlook COM)\n")
     init_excel(OUTPUT_FILE)
     listen()
 
