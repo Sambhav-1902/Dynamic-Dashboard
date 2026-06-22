@@ -45,18 +45,16 @@ bar charts by category and by assignee, and a list of Ongoing tickets
 sorted by days-in-Ongoing. See update_dashboard() for details.
 
 Requirements:
-    pip install pywin32 openpyxl sentence-transformers "transformers>=4.50.0" torch gliner parsedatetime
+    pip install pywin32 openpyxl sentence-transformers torch gliner parsedatetime llama-cpp-python
 
-Conversational resolution check (status detection for replies from anyone
-other than the original sender) uses google/gemma-3-1b-it — the SAME
-Gemma 3 1B model used via Ollama on the Gmail/personal-laptop version —
-but loaded in-process via the `transformers` library instead of Ollama.
-This office-laptop network blocks Ollama's model registry, so this
-version downloads the model directly from Hugging Face on first run
-instead (cached locally afterwards, no network needed after that).
-If you need to switch back to Ollama (e.g. running this on a network
-where Ollama IS reachable), see is_conversation_resolved() and swap it
-back to an HTTP call against a local Ollama server running gemma3:1b.
+Conversational resolution check uses google/gemma-3-1b-it in GGUF format
+(Q4_K_M, ~806MB) via llama-cpp-python — the same model and quantization
+format that Ollama uses internally, so speed is identical (~6-7s per check
+on CPU). Downloaded once from Hugging Face on first run, cached locally
+afterwards (no network needed after that). The GGUF file is NOT gated
+(it's a community conversion at bartowski/google_gemma-3-1b-it-GGUF),
+but the Hugging Face login you already set up is still used for the
+download.
 
 Run:
     python track_outlook_mails_com.py
@@ -377,55 +375,52 @@ def get_first_300_words(body):
 
 
 # ---------------------------------------------------------------------------
-# AI — Conversational resolution check (Gemma 3 1B instruction-tuned,
-# loaded in-process via transformers — no Ollama / local server required)
+# AI — Conversational resolution check (Gemma 3 1B — GGUF via llama-cpp-python)
 # ---------------------------------------------------------------------------
 #
 # This office-laptop version cannot reach Ollama's model registry (blocked
-# by the corporate network/proxy — confirmed via repeated 403 errors on
-# `ollama pull`, for multiple different models, ruling out a model-specific
-# issue). Regular HTTPS browsing — including huggingface.co — works fine
-# on this network, so the resolution-check model is loaded directly via
-# the `transformers` library instead: downloaded once from Hugging Face
-# on first run (cached locally afterwards under the default Hugging Face
-# cache folder, typically C:\Users\<you>\.cache\huggingface), then run
-# in-process with no network calls needed after that.
+# by the corporate network/proxy). Instead, we use llama-cpp-python to run
+# the same Gemma 3 1B model in GGUF format directly — this is exactly what
+# Ollama uses internally, so speed and accuracy are identical.
 #
-# This is the SAME Gemma 3 1B model used via Ollama on the Gmail/personal-
-# laptop version (google/gemma-3-1b-it is the instruction-tuned variant —
-# "-it" — matching what "gemma3:1b" pointed to in Ollama; the "-pt" variant
-# is the base/non-instruction-tuned model and is NOT what we want here).
-# Same model, same prompt, same decision logic — only HOW the model is
-# called changed (in-process generate() instead of an HTTP request to a
-# local Ollama server). Requires transformers >= 4.50.0 (Gemma 3 support).
+# The GGUF file (Q4_K_M quantization, ~806MB) is downloaded once from
+# Hugging Face via huggingface_hub and cached locally. All subsequent runs
+# load it from disk instantly — no network calls after the first download.
+#
+# Install: pip install llama-cpp-python
+# (no CUDA/GPU required — runs on CPU, same speed as Ollama's gemma3:1b)
 
-RESOLUTION_MODEL_NAME = "google/gemma-3-1b-it"
+RESOLUTION_GGUF_REPO = "bartowski/google_gemma-3-1b-it-GGUF"
+RESOLUTION_GGUF_FILE = "google_gemma-3-1b-it-Q4_K_M.gguf"
 
-print("Loading conversational resolution model (first run downloads it — this can take a few minutes)...")
-from transformers import AutoModelForCausalLM, AutoTokenizer
-resolution_tokenizer = AutoTokenizer.from_pretrained(RESOLUTION_MODEL_NAME)
-resolution_model     = AutoModelForCausalLM.from_pretrained(RESOLUTION_MODEL_NAME)
+print("Loading conversational resolution model...")
+from llama_cpp import Llama
+from huggingface_hub import hf_hub_download
+
+_gguf_path = hf_hub_download(
+    repo_id=RESOLUTION_GGUF_REPO,
+    filename=RESOLUTION_GGUF_FILE,
+)
+resolution_model = Llama(
+    model_path=_gguf_path,
+    n_ctx=4096,       # context window — enough for our conversation logs
+    n_threads=4,      # CPU threads; adjust up if your laptop has more cores
+    verbose=False,    # suppress llama.cpp's per-token progress output
+)
 print("Resolution model ready.\n")
 
 
 def is_conversation_resolved(conversation_log, original_sender):
     """
-    Asks a small local instruction model (gemma-3-1b-it, the same Gemma
-    3 1B model used via Ollama on the Gmail/personal-laptop version, but
-    run in-process via transformers instead) a single yes/no question: has EVERY
-    question/issue raised by original_sender been answered across the
-    WHOLE conversation (not just the latest reply)?
+    Asks gemma-3-1b-it (via llama-cpp-python, same GGUF format Ollama uses)
+    a single yes/no question: has EVERY question/issue raised by
+    original_sender been answered across the WHOLE conversation?
 
-    This handles multi-turn Q&A tickets where each question is answered
-    in a separate reply — a pattern single-message resolution checks
-    could not detect.
-
-    Returns True (Resolved) or False (Ongoing). If the model gives an
-    unclear response or anything goes wrong, defaults to False (Ongoing)
-    — a safe, conservative choice that can be manually corrected if
-    needed.
+    Returns True (Resolved) or False (Ongoing). Defaults to False if
+    anything goes wrong — a safe, conservative choice.
     """
-    prompt = f"""Below is a support ticket conversation, shown NEWEST message first. Each message shows the sender's email and their message.
+    prompt = f"""<start_of_turn>user
+Below is a support ticket conversation, shown NEWEST message first.
 
 Conversation:
 {conversation_log}
@@ -437,30 +432,25 @@ Question: Has EVERY question or issue raised by {original_sender} (across all of
 If even ONE question or issue from {original_sender} is still unanswered or unresolved, answer NO.
 Only answer YES if you can find an explicit answer/fix for EACH thing {original_sender} asked about.
 
-Answer with ONLY one word: YES or NO."""
+Answer with ONLY one word: YES or NO.<end_of_turn>
+<start_of_turn>model
+"""
 
     try:
-        messages = [{"role": "user", "content": prompt}]
-        text = resolution_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        output = resolution_model(
+            prompt,
+            max_tokens=10,
+            temperature=0.1,
+            stop=["<end_of_turn>", "\n"],
         )
-        inputs = resolution_tokenizer(text, return_tensors="pt")
+        text = output["choices"][0]["text"].strip().upper()
 
-        outputs = resolution_model.generate(
-            **inputs,
-            max_new_tokens=10,
-            do_sample=False,       # deterministic — matches temperature=0.1 intent from the Ollama version
-            pad_token_id=resolution_tokenizer.eos_token_id,
-        )
-        response_ids = outputs[0][inputs["input_ids"].shape[1]:]
-        response = resolution_tokenizer.decode(response_ids, skip_special_tokens=True).strip().upper()
-
-        if "YES" in response and "NO" not in response:
+        if "YES" in text and "NO" not in text:
             return True
-        elif "NO" in response:
+        elif "NO" in text:
             return False
         else:
-            print(f"   Unclear response from resolution model ({response!r}) — defaulting to Ongoing")
+            print(f"   Unclear response from resolution model ({text!r}) — defaulting to Ongoing")
             return False
 
     except Exception as e:
