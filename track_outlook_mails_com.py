@@ -1688,6 +1688,9 @@ def listen():
                 retry_queue = still_failed
                 if retry_queue:
                     print(f"Excel is still open — {len(retry_queue)} email(s) still waiting.")
+                else:
+                    # All queued emails saved — refresh dashboard
+                    update_dashboard(OUTPUT_FILE)
 
             check_due_date_and_resolve(OUTPUT_FILE)
 
@@ -1709,6 +1712,10 @@ def listen():
                         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
                         process_email(em, retry_queue, OUTPUT_FILE)
                 known_ids = current_ids
+                # Refresh dashboard now that new data has been processed —
+                # only called once per poll cycle even if multiple emails
+                # arrived, to avoid redundant rebuilds.
+                update_dashboard(OUTPUT_FILE)
 
             else:
                 if poll_count % 4 == 0:
