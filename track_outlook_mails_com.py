@@ -45,16 +45,15 @@ bar charts by category and by assignee, and a list of Ongoing tickets
 sorted by days-in-Ongoing. See update_dashboard() for details.
 
 Requirements:
-    pip install pywin32 openpyxl sentence-transformers torch gliner parsedatetime llama-cpp-python
+    pip install pywin32 openpyxl sentence-transformers torch gliner parsedatetime requests
 
-Conversational resolution check uses google/gemma-3-1b-it in GGUF format
-(Q4_K_M, ~806MB) via llama-cpp-python — the same model and quantization
-format that Ollama uses internally, so speed is identical (~6-7s per check
-on CPU). Downloaded once from Hugging Face on first run, cached locally
-afterwards (no network needed after that). The GGUF file is NOT gated
-(it's a community conversion at bartowski/google_gemma-3-1b-it-GGUF),
-but the Hugging Face login you already set up is still used for the
-download.
+Also requires Ollama running locally with gemma3:1b imported from a local GGUF file.
+The model was imported using a Modelfile pointing at the locally cached GGUF:
+    1. Create a Modelfile containing: FROM <path to google_gemma-3-1b-it-Q4_K_M.gguf>
+    2. Run: ollama create gemma3:1b -f Modelfile
+    3. Verify: ollama run gemma3:1b "Reply with only YES"
+Ollama must be running when this script starts (check the system tray or run
+`ollama serve`). If unreachable, resolution checks default to Ongoing.
 
 Run:
     python track_outlook_mails_com.py
@@ -63,6 +62,7 @@ Run:
 import win32com.client
 import pythoncom
 import email
+import requests
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 import openpyxl
@@ -202,10 +202,10 @@ def strip_html(text):
 def get_sender_smtp_address(item):
     """
     Returns a clean SMTP email address for the sender.
-    For internal Exchange senders, SenderEmailAddress returns an "EX"
-    (LegacyExchangeDN) string instead of a normal email address —
-    PropertyAccessor with PR_SMTP_ADDRESS resolves this via the Sender's
-    AddressEntry. Confirmed working for both EX and SMTP senders.
+    For internal Exchange senders, SenderEmailAddress returns an EX
+    format string instead of a normal SMTP email address.
+    PR_SMTP_ADDRESS resolves this to a clean address.
+    Confirmed working for both EX and SMTP sender types.
     """
     try:
         sender = item.Sender  # AddressEntry
@@ -375,52 +375,38 @@ def get_first_300_words(body):
 
 
 # ---------------------------------------------------------------------------
-# AI — Conversational resolution check (Gemma 3 1B — GGUF via llama-cpp-python)
+# AI — Conversational resolution check (Gemma 3 1B via local Ollama)
 # ---------------------------------------------------------------------------
 #
-# This office-laptop version cannot reach Ollama's model registry (blocked
-# by the corporate network/proxy). Instead, we use llama-cpp-python to run
-# the same Gemma 3 1B model in GGUF format directly — this is exactly what
-# Ollama uses internally, so speed and accuracy are identical.
+# Uses the same Ollama setup as the personal laptop version. The model
+# could not be downloaded via `ollama pull` (corporate network blocks
+# Ollama's registry), but was imported from a local GGUF file instead:
 #
-# The GGUF file (Q4_K_M quantization, ~806MB) is downloaded once from
-# Hugging Face via huggingface_hub and cached locally. All subsequent runs
-# load it from disk instantly — no network calls after the first download.
+#   1. The GGUF was downloaded from Hugging Face (bartowski/google_gemma-3-1b-it-GGUF)
+#   2. A Modelfile was created pointing at the local file path
+#   3. `ollama create gemma3:1b -f Modelfile` registered it with Ollama
 #
-# Install: pip install llama-cpp-python
-# (no CUDA/GPU required — runs on CPU, same speed as Ollama's gemma3:1b)
+# Ollama runs as a background service on Windows after installation.
+# No extra Python packages needed — just the `requests` library (already
+# used elsewhere in this script).
 
-RESOLUTION_GGUF_REPO = "bartowski/google_gemma-3-1b-it-GGUF"
-RESOLUTION_GGUF_FILE = "google_gemma-3-1b-it-Q4_K_M.gguf"
-
-print("Loading conversational resolution model...")
-from llama_cpp import Llama
-from huggingface_hub import hf_hub_download
-
-_gguf_path = hf_hub_download(
-    repo_id=RESOLUTION_GGUF_REPO,
-    filename=RESOLUTION_GGUF_FILE,
-)
-resolution_model = Llama(
-    model_path=_gguf_path,
-    n_ctx=4096,       # context window — enough for our conversation logs
-    n_threads=4,      # CPU threads; adjust up if your laptop has more cores
-    verbose=False,    # suppress llama.cpp's per-token progress output
-)
-print("Resolution model ready.\n")
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "gemma3:1b"
 
 
 def is_conversation_resolved(conversation_log, original_sender):
     """
-    Asks gemma-3-1b-it (via llama-cpp-python, same GGUF format Ollama uses)
-    a single yes/no question: has EVERY question/issue raised by
-    original_sender been answered across the WHOLE conversation?
+    Asks gemma3:1b (via local Ollama) a single yes/no question: has EVERY
+    question/issue raised by original_sender been answered across the
+    WHOLE conversation (not just the latest reply)?
+
+    Identical to the personal laptop version — same model, same prompt,
+    same decision logic, same ~6-7s per call speed.
 
     Returns True (Resolved) or False (Ongoing). Defaults to False if
-    anything goes wrong — a safe, conservative choice.
+    Ollama is unreachable or gives an unclear response.
     """
-    prompt = f"""<start_of_turn>user
-Below is a support ticket conversation, shown NEWEST message first.
+    prompt = f"""Below is a support ticket conversation, shown NEWEST message first. Each message shows the sender's email and their message.
 
 Conversation:
 {conversation_log}
@@ -432,29 +418,27 @@ Question: Has EVERY question or issue raised by {original_sender} (across all of
 If even ONE question or issue from {original_sender} is still unanswered or unresolved, answer NO.
 Only answer YES if you can find an explicit answer/fix for EACH thing {original_sender} asked about.
 
-Answer with ONLY one word: YES or NO.<end_of_turn>
-<start_of_turn>model
-"""
+Answer with ONLY one word: YES or NO."""
 
     try:
-        output = resolution_model(
-            prompt,
-            max_tokens=10,
-            temperature=0.1,
-            stop=["<end_of_turn>", "\n"],
-        )
-        text = output["choices"][0]["text"].strip().upper()
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1}
+        }, timeout=30)
+        text = response.json()["response"].strip().upper()
 
         if "YES" in text and "NO" not in text:
             return True
         elif "NO" in text:
             return False
         else:
-            print(f"   Unclear response from resolution model ({text!r}) — defaulting to Ongoing")
+            print(f"   Unclear response from Gemma ({text!r}) — defaulting to Ongoing")
             return False
 
     except Exception as e:
-        print(f"   Resolution model error ({e}) — defaulting to Ongoing.")
+        print(f"   Could not reach Ollama ({e}) — defaulting to Ongoing.")
         return False
 
 
