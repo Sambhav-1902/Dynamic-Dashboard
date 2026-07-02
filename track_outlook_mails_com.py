@@ -1289,44 +1289,36 @@ def update_dashboard(filepath):
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{charts_row}")
 
-    # Primary Base Chart (Left Y-Axis: Ticket Volume)
+    # Single chart initialization handles all columns without structural mapping loops
     cat_bar = BarChart()
     cat_bar.type     = "col"
     cat_bar.grouping = "clustered"
     cat_bar.title    = "Ticket Volume & Worth by Category"
+    
+    # Left Y-Axis Setup (Ticket Volume)
     cat_bar.y_axis.title = "Number of Tickets"
     cat_bar.y_axis.numFmt = "0"
+    cat_bar.y_axis.axId = 100
     
-    # Read Pending (Col 5) and Ongoing (Col 6)
-    data_volume = Reference(dws, min_col=5, max_col=6, min_row=CAT_ROW, max_row=cat_end)
-    cats_ref = Reference(dws, min_col=4, min_row=CAT_ROW + 1, max_row=cat_end)
+    # Grab columns 5, 6, and 7 simultaneously (Pending, Ongoing, Total Worth)
+    all_data_ref = Reference(dws, min_col=5, max_col=7, min_row=CAT_ROW, max_row=cat_end)
+    cats_ref     = Reference(dws, min_col=4, min_row=CAT_ROW + 1, max_row=cat_end)
     
-    cat_bar.add_data(data_volume, titles_from_data=True)
+    cat_bar.add_data(all_data_ref, titles_from_data=True)
     cat_bar.set_categories(cats_ref)
     
-    # Secondary Stacked Chart (Right Y-Axis: Currency Value)
-    cat_bar_worth = BarChart()
-    cat_bar_worth.type     = "col"
-    cat_bar_worth.grouping = "clustered"
+    # Define Secondary Right Y-Axis explicitly
+    right_axis = NumericAxis(axId=200, title="Total Worth ($)", crosses="max", majorGridlines=None)
+    right_axis.numFmt = '"$"#,##0'
     
-    # Read Total Worth (Col 7)
-    data_worth = Reference(dws, min_col=7, min_row=CAT_ROW, max_row=cat_end)
-    cat_bar_worth.add_data(data_worth, titles_from_data=True)
-    cat_bar_worth.set_categories(cats_ref)
+    # Append the right axis properties cleanly onto the top-level chart map
+    cat_bar.y_axis.crosses = "autoZero"
+    cat_bar.append(right_axis)
     
-    # Define secondary axis explicitly and associate it correctly before adding chart structures
-    cat_bar_worth.y_axis = NumericAxis(axId=200, title="Total Worth ($)", crosses="max", majorGridlines=None)
-    cat_bar_worth.y_axis.numFmt = '"$"#,##0'
-    cat_bar_worth.x_axis = cat_bar.x_axis  # Must share the identical X-Axis relation
+    # Isolate series index 2 (Worth Column) and re-route its axis pointer to axis 200
+    cat_bar.series[2].axId = 200
     
-    # Bind the second axis reference to the top level chart layout
-    cat_bar.y_axis.axId = 100
-    cat_bar_worth.y_axis.crosses = "max"
-    
-    # Combine charts safely
-    cat_bar += cat_bar_worth
-    
-    # Explicit series color mapping after combination to secure openpyxl series bindings
+    # Map colors cleanly matching tracking styles
     cat_bar.series[0].graphicalProperties.solidFill = STATUS_COLORS["Pending"]   # FFF2CC
     cat_bar.series[1].graphicalProperties.solidFill = STATUS_COLORS["Ongoing"]   # DDEEFF
     cat_bar.series[2].graphicalProperties.solidFill = "2E75B6"                       # Deep TechOps Blue for Worth
