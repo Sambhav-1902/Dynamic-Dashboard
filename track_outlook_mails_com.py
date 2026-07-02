@@ -1289,36 +1289,45 @@ def update_dashboard(filepath):
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{charts_row}")
 
-    # Single chart initialization handles all columns without structural mapping loops
+    # FIXED: Isolate base volume references away from the secondary worth metrics object references
     cat_bar = BarChart()
     cat_bar.type     = "col"
     cat_bar.grouping = "clustered"
     cat_bar.title    = "Ticket Volume & Worth by Category"
     
-    # Left Y-Axis Setup (Ticket Volume)
+    # Left Axis Setup (Ticket Volume)
     cat_bar.y_axis.title = "Number of Tickets"
     cat_bar.y_axis.numFmt = "0"
     cat_bar.y_axis.axId = 100
     
-    # Grab columns 5, 6, and 7 simultaneously (Pending, Ongoing, Total Worth)
-    all_data_ref = Reference(dws, min_col=5, max_col=7, min_row=CAT_ROW, max_row=cat_end)
-    cats_ref     = Reference(dws, min_col=4, min_row=CAT_ROW + 1, max_row=cat_end)
+    # Reference ONLY volume blocks (Col 5 = Pending, Col 6 = Ongoing)
+    data_volume_ref = Reference(dws, min_col=5, max_col=6, min_row=CAT_ROW, max_row=cat_end)
+    cats_ref        = Reference(dws, min_col=4, min_row=CAT_ROW + 1, max_row=cat_end)
     
-    cat_bar.add_data(all_data_ref, titles_from_data=True)
+    cat_bar.add_data(data_volume_ref, titles_from_data=True)
     cat_bar.set_categories(cats_ref)
     
-    # Define Secondary Right Y-Axis explicitly
+    # Initialize a temporary container to read Worth Series data (Col 7) cleanly
+    temp_worth_chart = BarChart()
+    data_worth_ref   = Reference(dws, min_col=7, min_row=CAT_ROW, max_row=cat_end)
+    temp_worth_chart.add_data(data_worth_ref, titles_from_data=True)
+    
+    # Extract the separate structured series object and inject it explicitly into the base layout array
+    worth_series = temp_worth_chart.series[0]
+    cat_bar.series.append(worth_series)
+    
+    # Define Right Numerical Axis explicitly
     right_axis = NumericAxis(axId=200, title="Total Worth ($)", crosses="max", majorGridlines=None)
     right_axis.numFmt = '"$"#,##0'
     
-    # Append the right axis properties cleanly onto the top-level chart map
+    # Bind right axis constraints directly inside the top level chart properties
     cat_bar.y_axis.crosses = "autoZero"
     cat_bar.append(right_axis)
     
-    # Isolate series index 2 (Worth Column) and re-route its axis pointer to axis 200
+    # Formally map index 2 series pointer target to right axis tracker 200
     cat_bar.series[2].axId = 200
     
-    # Map colors cleanly matching tracking styles
+    # Map colors cleanly matching global configuration tags
     cat_bar.series[0].graphicalProperties.solidFill = STATUS_COLORS["Pending"]   # FFF2CC
     cat_bar.series[1].graphicalProperties.solidFill = STATUS_COLORS["Ongoing"]   # DDEEFF
     cat_bar.series[2].graphicalProperties.solidFill = "2E75B6"                       # Deep TechOps Blue for Worth
