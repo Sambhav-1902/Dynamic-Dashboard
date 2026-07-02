@@ -80,6 +80,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import PieChart, BarChart, Reference
+from openpyxl.chart.axis import NumericAxis
 from openpyxl.chart.label import DataLabelList
 from openpyxl.drawing.text import CharacterProperties, ParagraphProperties
 import os
@@ -505,6 +506,8 @@ def get_first_300_words(body):
     """Returns the first 300 words of the new reply text (quoted content stripped)."""
     text = strip_quoted_content(body)
     return " ".join(text.split()[:300])
+
+
 def extract_worth(body):
     """Extracts the first monetary amount mentioned in the email body.
     Handles formats like $100, $1,000, $1.5k, USD 500, 100 dollars, Rs 500, INR 1000.
@@ -541,8 +544,6 @@ def extract_worth(body):
 
 
 # AI — Status detection helpers
-
-
 
 
 # Assignee name extraction
@@ -1205,14 +1206,18 @@ def update_dashboard(filepath):
         dws.cell(row=PIE_ROW + i, column=2, value=status_counts[s])
     pie_end = PIE_ROW + len(DASH_STATUSES) - 1
 
-    # Category worth data: col D (label), E (total worth) — row 1 = header
+    # Super Combined Category Data: col D (Category), E (Pending), F (Ongoing), G (Total Worth)
     CAT_ROW = 1
     dws.cell(row=CAT_ROW, column=4, value="Category")
-    dws.cell(row=CAT_ROW, column=5, value="Total Worth ($)")
+    dws.cell(row=CAT_ROW, column=5, value="Pending")
+    dws.cell(row=CAT_ROW, column=6, value="Ongoing")
+    dws.cell(row=CAT_ROW, column=7, value="Total Worth ($)")
     for i, cat in enumerate(categories):
         r = CAT_ROW + 1 + i
         dws.cell(row=r, column=4, value=cat)
-        dws.cell(row=r, column=5, value=round(cat_breakdown[cat]["worth"], 2))
+        dws.cell(row=r, column=5, value=cat_breakdown[cat]["Pending"])
+        dws.cell(row=r, column=6, value=cat_breakdown[cat]["Ongoing"])
+        dws.cell(row=r, column=7, value=round(cat_breakdown[cat]["worth"], 2))
     cat_end = CAT_ROW + len(categories)
 
     # Assignee data: col H (label), I (Pending), J (Ongoing)  — row 1 = header
@@ -1248,7 +1253,7 @@ def update_dashboard(filepath):
     row = 5
     row = _dash_section_header(ws, row, "Overview")
     for label, value, numfmt in [
-        ("Total Tickets",          total,                   None),
+        ("Total Tickets",          total,                    None),
         ("Pending",                status_counts["Pending"],  None),
         ("Ongoing",                status_counts["Ongoing"],  None),
         ("Resolved",               status_counts["Resolved"], None),
@@ -1263,8 +1268,8 @@ def update_dashboard(filepath):
         row += 1
     row += 1
 
-    # Section 2: Pie + Category bar side by side (no tables on Dashboard)
-    row = _dash_section_header(ws, row, "Status & Category Breakdown", span=14)
+    # Section 2: Pie + Super Combined Category bar side by side
+    row = _dash_section_header(ws, row, "Status & Category Ticket Metrics", span=14)
     charts_row = row
 
     pie = PieChart()
@@ -1287,27 +1292,49 @@ def update_dashboard(filepath):
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{charts_row}")
 
+    # Primary Base Chart (Left Y-Axis: Ticket Volume)
     cat_bar = BarChart()
     cat_bar.type     = "col"
     cat_bar.grouping = "clustered"
-    cat_bar.title    = "Worth by Category ($)"
-    cat_bar.y_axis.title = "Total Worth ($)"
-    cat_bar.y_axis.numFmt = '"$"#,##0'
-    cat_bar.add_data(
-        Reference(dws, min_col=5,
-                  min_row=CAT_ROW, max_row=cat_end),
-        titles_from_data=True,
-    )
-    cat_bar.set_categories(
-        Reference(dws, min_col=4,
-                  min_row=CAT_ROW + 1, max_row=cat_end),
-    )
-    cat_bar.series[0].graphicalProperties.solidFill = "2E75B6"
+    cat_bar.title    = "Ticket Volume & Worth by Category"
+    cat_bar.y_axis.title = "Number of Tickets"
+    cat_bar.y_axis.numFmt = "0"
+    
+    # Read Pending (Col 5) and Ongoing (Col 6)
+    data_volume = Reference(dws, min_col=5, max_col=6, min_row=CAT_ROW, max_row=cat_end)
+    cats_ref = Reference(dws, min_col=4, min_row=CAT_ROW + 1, max_row=cat_end)
+    
+    cat_bar.add_data(data_volume, titles_from_data=True)
+    cat_bar.set_categories(cats_ref)
+    
+    # Secondary Stacked Chart (Right Y-Axis: Currency Value)
+    cat_bar_worth = BarChart()
+    cat_bar_worth.type     = "col"
+    cat_bar_worth.grouping = "clustered"
+    
+    # Read Total Worth (Col 7)
+    data_worth = Reference(dws, min_col=7, min_row=CAT_ROW, max_row=cat_end)
+    cat_bar_worth.add_data(data_worth, titles_from_data=True)
+    cat_bar_worth.set_categories(cats_ref)
+    
+    # Create right-hand numerical axis instance linked to max crossing point
+    cat_bar_worth.y_axis = NumericAxis(axId=200, title="Total Worth ($)", crosses="max", majorGridlines=None)
+    cat_bar_worth.y_axis.numFmt = '"$"#,##0'
+    
+    # Merge structural series configurations inside parent chart object
+    cat_bar += cat_bar_worth
+    
+    # Explicit series coloring mapped to specific metrics
+    cat_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]  # FFC000
+    cat_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]  # 5B9BD5
+    cat_bar.series[2].graphicalProperties.solidFill = "2E75B6"                       # Worth Fill
+    
     cat_bar.height = 9
     cat_bar.width  = 18
     cat_bar.x_axis.textRotation = -30
     cat_bar.x_axis.delete = False
     cat_bar.y_axis.delete = False
+    
     _dash_set_title(cat_bar,        size_pt=14)
     _dash_set_title(cat_bar.y_axis, size_pt=10)
     ws.add_chart(cat_bar, f"H{charts_row}")
