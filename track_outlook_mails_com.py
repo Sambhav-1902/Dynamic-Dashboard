@@ -468,9 +468,6 @@ def extract_deadline(body):
     return ""
 
 
-# AI — Status detection helpers
-
-
 def strip_quoted_content(body):
     """Strips quoted/forwarded content from an email, keeping only the new text."""
     text = body.strip()
@@ -508,6 +505,44 @@ def get_first_300_words(body):
     """Returns the first 300 words of the new reply text (quoted content stripped)."""
     text = strip_quoted_content(body)
     return " ".join(text.split()[:300])
+def extract_worth(body):
+    """Extracts the first monetary amount mentioned in the email body.
+    Handles formats like $100, $1,000, $1.5k, USD 500, 100 dollars, Rs 500, INR 1000.
+    Returns a float (the dollar/currency amount) or 0.0 if nothing found.
+    For non-USD currencies (Rs, INR) the raw number is stored as-is for comparison.
+    """
+    text = get_first_300_words(body)
+
+    # Patterns: $1,000.50 / $ 1000 / USD 1,000 / 1000 USD / 1.5k dollars / Rs 500 / INR 1000
+    patterns = [
+        r'\$\s*([\d,]+(?:\.\d+)?)\s*[kK]?',        # $100 / $1,000 / $1.5k
+        r'USD\s*([\d,]+(?:\.\d+)?)\s*[kK]?',        # USD 500
+        r'([\d,]+(?:\.\d+)?)\s*USD',                 # 500 USD
+        r'([\d,]+(?:\.\d+)?)\s*dollars?',            # 100 dollars
+        r'Rs\.?\s*([\d,]+(?:\.\d+)?)',               # Rs 500 / Rs. 500
+        r'INR\s*([\d,]+(?:\.\d+)?)',                  # INR 1000
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            raw = match.group(1).replace(",", "")
+            try:
+                amount = float(raw)
+                # Handle k suffix (e.g. $1.5k)
+                full = match.group(0)
+                if full.lower().endswith('k'):
+                    amount *= 1000
+                return amount
+            except ValueError:
+                continue
+
+    return 0.0
+
+
+# AI — Status detection helpers
+
+
 
 
 # Assignee name extraction
@@ -548,6 +583,7 @@ HEADERS = [
     "#", "Sender Name", "Sender Email", "Subject", "Category",
     "Received Date & Time", "Latest Reply Date & Time", "Status",
     "Ongoing Since", "Assigned To", "Followups", "Due Date", "Body", "Message-ID",
+    "Worth ($)",
 ]
 
 COL_NUM          = 1
@@ -564,6 +600,7 @@ COL_FOLLOWUPS    = 11
 COL_DUE_DATE     = 12
 COL_BODY         = 13
 COL_MESSAGE_ID   = 14
+COL_WORTH        = 15
 
 STATUS_COLORS = {
     "Pending":  "FFF2CC",
@@ -604,6 +641,7 @@ def init_excel(filepath):
     ws.column_dimensions["L"].width = 20
     ws.column_dimensions["M"].width = 60
     ws.column_dimensions["N"].width = 40
+    ws.column_dimensions["O"].width = 14  # Worth ($)
     ws.row_dimensions[1].height = 30
 
     wb.save(filepath)
@@ -660,6 +698,7 @@ def append_new_email(em, filepath):
         row_fill     = alt_fill if index % 2 == 0 else PatternFill()
         category     = detect_categories(em["body"])
         due_date     = extract_deadline(em["body"])
+        worth        = extract_worth(em["body"])
         clean_body   = strip_quoted_content(em["body"])
         initial_body = f"[{em['received']}] {em['sender_email']}:\n{clean_body}"
 
@@ -667,6 +706,7 @@ def append_new_email(em, filepath):
             index, em["sender_name"], em["sender_email"], em["subject"],
             category, em["received"], "",
             "Pending", "", "", 0, due_date, initial_body, em["message_id"],
+            worth if worth > 0 else "",
         ]
 
         for col, value in enumerate(values, start=1):
@@ -746,6 +786,18 @@ def update_existing_row(em, target_row, filepath):
         if due_date:
             ws.cell(row=target_row, column=COL_DUE_DATE).value     = due_date
             ws.cell(row=target_row, column=COL_DUE_DATE).alignment = Alignment(vertical="top")
+
+        # Update worth if a higher value is mentioned in this reply
+        new_worth = extract_worth(em["body"])
+        if new_worth > 0:
+            existing_worth = ws.cell(row=target_row, column=COL_WORTH).value or 0
+            try:
+                existing_worth = float(existing_worth)
+            except (ValueError, TypeError):
+                existing_worth = 0
+            if new_worth > existing_worth:
+                ws.cell(row=target_row, column=COL_WORTH).value     = new_worth
+                ws.cell(row=target_row, column=COL_WORTH).alignment = Alignment(vertical="top")
 
         if not is_same_sender:
             assignee = extract_assignee_name(em["sender_name"], em["sender_email"], em["body"])
@@ -1003,6 +1055,11 @@ def _dash_read_tickets(data_ws):
         num = data_ws.cell(row=row, column=COL_NUM).value
         if num is None:
             continue
+        raw_worth = data_ws.cell(row=row, column=COL_WORTH).value
+        try:
+            worth = float(raw_worth) if raw_worth else 0.0
+        except (ValueError, TypeError):
+            worth = 0.0
         tickets.append({
             "num":           num,
             "sender_name":   data_ws.cell(row=row, column=COL_SENDER_NAME).value or "",
@@ -1016,6 +1073,7 @@ def _dash_read_tickets(data_ws):
             "assigned_to":   data_ws.cell(row=row, column=COL_ASSIGNED_TO).value or "",
             "followups":     data_ws.cell(row=row, column=COL_FOLLOWUPS).value or 0,
             "due_date":      data_ws.cell(row=row, column=COL_DUE_DATE).value or "",
+            "worth":         worth,
         })
     return tickets
 
@@ -1026,15 +1084,44 @@ def _dash_status_counts(tickets):
 
 
 def _dash_category_breakdown(tickets, categories):
-    """Counts Pending/Ongoing tickets per category. Multi-label tickets count toward each category."""
-    breakdown = {cat: {"Pending": 0, "Ongoing": 0} for cat in categories}
+    """Counts Pending/Ongoing tickets per category and sums their worth.
+    Multi-label tickets count toward each category."""
+    breakdown = {cat: {"Pending": 0, "Ongoing": 0, "worth": 0.0} for cat in categories}
     for t in tickets:
         if t["status"] not in ("Pending", "Ongoing"):
             continue
-        for cat in [c.strip() for c in (t["category"] or "").split(",") if c.strip()]:
+        cats = [c.strip() for c in (t["category"] or "").split(",") if c.strip()]
+        for cat in cats:
             if cat in breakdown:
                 breakdown[cat][t["status"]] += 1
+                breakdown[cat]["worth"] += t.get("worth", 0.0)
     return breakdown
+
+
+WORTH_BUCKETS = [
+    (0,     50,    "$0–50"),
+    (50,    100,   "$50–100"),
+    (100,   500,   "$100–500"),
+    (500,   1000,  "$500–1K"),
+    (1000,  5000,  "$1K–5K"),
+    (5000,  None,  "$5K+"),
+]
+
+
+def _dash_worth_buckets(tickets):
+    """Counts tickets by worth bucket. Tickets with worth=0 are counted in $0-50."""
+    counts = {label: 0 for _, _, label in WORTH_BUCKETS}
+    for t in tickets:
+        w = t.get("worth", 0.0)
+        for lo, hi, label in WORTH_BUCKETS:
+            if hi is None:
+                if w >= lo:
+                    counts[label] += 1
+                    break
+            elif lo <= w < hi:
+                counts[label] += 1
+                break
+    return counts
 
 
 def _dash_assignee_breakdown(tickets):
@@ -1064,9 +1151,7 @@ def _dash_ongoing_list(tickets, now):
 
 
 def update_dashboard(filepath):
-    """Rebuilds the Dashboard sheet as a static snapshot: overview counts, status pie chart,
-    category and assignee bar charts, and a list of Ongoing tickets sorted by days open.
-    Called automatically whenever new data is processed. Returns True on success."""
+    """Rebuilds the Dashboard sheet as a static snapshot. Returns True on success."""
     try:
         wb = openpyxl.load_workbook(filepath)
     except PermissionError:
@@ -1098,6 +1183,7 @@ def update_dashboard(filepath):
     cat_breakdown      = _dash_category_breakdown(tickets, categories)
     assignee_breakdown = _dash_assignee_breakdown(tickets)
     ongoing_list       = _dash_ongoing_list(tickets, now)
+    worth_buckets      = _dash_worth_buckets(tickets)
 
     total           = len(tickets)
     resolution_rate = (status_counts["Resolved"] / total) if total else 0
@@ -1108,7 +1194,9 @@ def update_dashboard(filepath):
     ws["B3"] = f"Generated: {now.strftime('%Y-%m-%d %H:%M')}"
     ws["B3"].font = DASH_SUBTITLE_FONT
 
+    # ------------------------------------------------------------------
     # Section 1: Overview
+    # ------------------------------------------------------------------
     row = 5
     row = _dash_section_header(ws, row, "Overview")
     for label, value, numfmt in [
@@ -1127,104 +1215,232 @@ def update_dashboard(filepath):
         row += 1
     row += 1
 
-    # Section 2: Status pie chart — chart left, table right
-    row = _dash_section_header(ws, row, "Status Breakdown")
-    status_table_row = row
-    ws.cell(row=row, column=6, value="Status").font = DASH_LABEL_FONT
-    ws.cell(row=row, column=7, value="Count").font = DASH_LABEL_FONT
-    row += 1
-    for status in DASH_STATUSES:
-        ws.cell(row=row, column=6, value=status).font = DASH_VALUE_FONT
-        ws.cell(row=row, column=7, value=status_counts[status]).font = DASH_VALUE_FONT
-        row += 1
-    status_table_end = row - 1
+    # ------------------------------------------------------------------
+    # Section 2: Pie chart (status) + Category bar chart side by side.
+    # Both charts share the same row. The pie anchors at col B, the
+    # category bar anchors at col H (right of the pie).
+    # We write data tables for both in hidden columns further right
+    # (cols P+ so they don't appear in the visible dashboard area)
+    # ------------------------------------------------------------------
+    section_start_row = row
+    row = _dash_section_header(ws, row, "Status & Category Breakdown")
+    charts_row = row  # both charts anchor here
+
+    # --- Pie chart data (cols P, Q — hidden from main view) ---
+    pie_data_col   = 16   # col P
+    pie_label_col  = 17   # col Q
+    ws.cell(row=charts_row,     column=pie_label_col, value="Status")
+    ws.cell(row=charts_row,     column=pie_data_col,  value="Count")
+    for i, status in enumerate(DASH_STATUSES):
+        ws.cell(row=charts_row + 1 + i, column=pie_label_col, value=status)
+        ws.cell(row=charts_row + 1 + i, column=pie_data_col,  value=status_counts[status])
+    pie_data_end = charts_row + len(DASH_STATUSES)
 
     pie = PieChart()
     pie.title = "Tickets by Status"
-    pie.add_data(Reference(ws, min_col=7, min_row=status_table_row, max_row=status_table_end), titles_from_data=True)
-    pie.set_categories(Reference(ws, min_col=6, min_row=status_table_row + 1, max_row=status_table_end))
-    pie.height = 7.5
-    pie.width = 11
+    pie.add_data(
+        Reference(ws, min_col=pie_data_col, min_row=charts_row, max_row=pie_data_end),
+        titles_from_data=True,
+    )
+    pie.set_categories(
+        Reference(ws, min_col=pie_label_col, min_row=charts_row + 1, max_row=pie_data_end),
+    )
+    pie.height = 9
+    pie.width  = 13
     pie.dataLabels = DataLabelList()
-    pie.dataLabels.showVal = False
-    pie.dataLabels.showPercent = True
-    pie.dataLabels.showCatName = False
-    pie.dataLabels.showLegendKey = False
-    pie.dataLabels.showSerName = False
+    pie.dataLabels.showVal        = False
+    pie.dataLabels.showPercent    = True
+    pie.dataLabels.showCatName    = False
+    pie.dataLabels.showLegendKey  = False
+    pie.dataLabels.showSerName    = False
     _dash_set_title(pie, size_pt=14)
-    ws.add_chart(pie, f"B{status_table_row}")
-    row = max(row, status_table_row + 16) + 1
+    ws.add_chart(pie, f"B{charts_row}")
 
-    # Section 3: Category bar chart — chart left, table right
-    row = _dash_section_header(ws, row, "Tickets by Category (Pending vs Ongoing)")
-    cat_table_row = row
-    ws.cell(row=row, column=10, value="Category").font = DASH_LABEL_FONT
-    ws.cell(row=row, column=11, value="Pending").font = DASH_LABEL_FONT
-    ws.cell(row=row, column=12, value="Ongoing").font = DASH_LABEL_FONT
-    row += 1
-    for cat in categories:
-        ws.cell(row=row, column=10, value=cat).font = DASH_VALUE_FONT
-        ws.cell(row=row, column=11, value=cat_breakdown[cat]["Pending"]).font = DASH_VALUE_FONT
-        ws.cell(row=row, column=12, value=cat_breakdown[cat]["Ongoing"]).font = DASH_VALUE_FONT
-        row += 1
-    cat_table_end = row - 1
+    # --- Category bar chart data (cols R, S, T — hidden from main view) ---
+    cat_data_col   = 18   # col R  (labels)
+    cat_pend_col   = 19   # col S  (Pending counts)
+    cat_ong_col    = 20   # col T  (Ongoing counts)
+    cat_worth_col  = 21   # col U  (total worth per category, for data labels)
+
+    ws.cell(row=charts_row, column=cat_data_col,  value="Category")
+    ws.cell(row=charts_row, column=cat_pend_col,  value="Pending")
+    ws.cell(row=charts_row, column=cat_ong_col,   value="Ongoing")
+    ws.cell(row=charts_row, column=cat_worth_col, value="Worth ($)")
+    for i, cat in enumerate(categories):
+        r = charts_row + 1 + i
+        ws.cell(row=r, column=cat_data_col,  value=cat)
+        ws.cell(row=r, column=cat_pend_col,  value=cat_breakdown[cat]["Pending"])
+        ws.cell(row=r, column=cat_ong_col,   value=cat_breakdown[cat]["Ongoing"])
+        worth_val = cat_breakdown[cat]["worth"]
+        ws.cell(row=r, column=cat_worth_col, value=round(worth_val, 2) if worth_val else "")
+    cat_data_end = charts_row + len(categories)
 
     cat_bar = BarChart()
-    cat_bar.type = "col"
+    cat_bar.type     = "col"
     cat_bar.grouping = "clustered"
-    cat_bar.title = "Tickets by Category"
+    cat_bar.title    = "Tickets by Category"
     cat_bar.y_axis.title = "Number of Tickets"
-    cat_bar.add_data(Reference(ws, min_col=11, max_col=12, min_row=cat_table_row, max_row=cat_table_end), titles_from_data=True)
-    cat_bar.set_categories(Reference(ws, min_col=10, min_row=cat_table_row + 1, max_row=cat_table_end))
+    # Force integer y-axis
+    from openpyxl.chart.axis import NumericAxis
+    cat_bar.y_axis.numFmt   = "0"
+    cat_bar.y_axis.majorUnit = 1
+    cat_bar.add_data(
+        Reference(ws, min_col=cat_pend_col, max_col=cat_ong_col,
+                  min_row=charts_row, max_row=cat_data_end),
+        titles_from_data=True,
+    )
+    cat_bar.set_categories(
+        Reference(ws, min_col=cat_data_col, min_row=charts_row + 1, max_row=cat_data_end),
+    )
     cat_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
     cat_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
     cat_bar.height = 9
-    cat_bar.width = 20
+    cat_bar.width  = 18
     cat_bar.x_axis.textRotation = -30
-    cat_bar.x_axis.delete = False  # openpyxl 3.1.4+ bug: axes hidden in Excel unless explicitly set
+    cat_bar.x_axis.delete = False
     cat_bar.y_axis.delete = False
-    _dash_set_title(cat_bar, size_pt=14)
-    _dash_set_title(cat_bar.y_axis, size_pt=10)
-    ws.add_chart(cat_bar, f"B{cat_table_row}")
-    row = max(row, cat_table_row + 19) + 1
+    _dash_set_title(cat_bar,         size_pt=14)
+    _dash_set_title(cat_bar.y_axis,  size_pt=10)
 
-    # Section 4: Assignee bar chart — chart left, table right
+    # Add worth totals as data labels above each category bar group.
+    # openpyxl doesn't support free-floating text annotations on charts,
+    # so we add a third invisible bar series (gap width 500, no fill,
+    # no border, fully transparent) whose only purpose is to carry the
+    # worth total as a data label above the bars.  The series values are
+    # written into cat_worth_col which was already populated above.
+    # We set the series fill to white/transparent and value=0 equivalent
+    # so it doesn't visually disturb the existing bars.
+    from openpyxl.chart.series import SeriesLabel
+    from openpyxl.chart.data_source import NumDataSource, NumRef
+
+    worth_series_ref = Reference(
+        ws,
+        min_col=cat_worth_col,
+        min_row=charts_row,        # includes header row → titles_from_data handles it
+        max_row=cat_data_end,
+    )
+    cat_bar.add_data(worth_series_ref, titles_from_data=True)
+    worth_series = cat_bar.series[2]
+    # Make the series visually invisible — no fill, no border
+    worth_series.graphicalProperties.solidFill = "FFFFFF"
+    worth_series.graphicalProperties.line.solidFill = "FFFFFF"
+    # Show only the value as a data label; position it outside-end (above bar)
+    worth_series.dLbls = DataLabelList()
+    worth_series.dLbls.showVal  = True
+    worth_series.dLbls.showCatName = False
+    worth_series.dLbls.showSerName = False
+    worth_series.dLbls.showLegendKey = False
+    worth_series.dLbls.showPercent = False
+    worth_series.dLbls.position = "outEnd"
+    # Format: prefix $ and no decimal if whole number
+    worth_series.dLbls.numFmt = '"$"#,##0.##'
+
+    # Anchor cat bar chart at column H (right of the pie chart)
+    ws.add_chart(cat_bar, f"H{charts_row}")
+
+    row = max(row, charts_row + 18) + 1
+
+    # ------------------------------------------------------------------
+    # Section 3: Assignee bar chart (no side table)
+    # ------------------------------------------------------------------
     row = _dash_section_header(ws, row, "Tickets by Assignee (Pending vs Ongoing)")
     assignee_table_row = row
-    ws.cell(row=row, column=10, value="Assignee").font = DASH_LABEL_FONT
-    ws.cell(row=row, column=11, value="Pending").font = DASH_LABEL_FONT
-    ws.cell(row=row, column=12, value="Ongoing").font = DASH_LABEL_FONT
+
+    # Data in hidden cols (V, W, X)
+    asgn_label_col = 22
+    asgn_pend_col  = 23
+    asgn_ong_col   = 24
+    ws.cell(row=row, column=asgn_label_col, value="Assignee")
+    ws.cell(row=row, column=asgn_pend_col,  value="Pending")
+    ws.cell(row=row, column=asgn_ong_col,   value="Ongoing")
     row += 1
     for name, counts in assignee_breakdown.items():
-        ws.cell(row=row, column=10, value=name).font = DASH_VALUE_FONT
-        ws.cell(row=row, column=11, value=counts["Pending"]).font = DASH_VALUE_FONT
-        ws.cell(row=row, column=12, value=counts["Ongoing"]).font = DASH_VALUE_FONT
+        ws.cell(row=row, column=asgn_label_col, value=name)
+        ws.cell(row=row, column=asgn_pend_col,  value=counts["Pending"])
+        ws.cell(row=row, column=asgn_ong_col,   value=counts["Ongoing"])
         row += 1
     assignee_table_end = row - 1
 
     assignee_bar = BarChart()
-    assignee_bar.type = "col"
+    assignee_bar.type     = "col"
     assignee_bar.grouping = "clustered"
-    assignee_bar.title = "Tickets by Assignee"
+    assignee_bar.title    = "Tickets by Assignee"
     assignee_bar.y_axis.title = "Number of Tickets"
-    assignee_bar.add_data(Reference(ws, min_col=11, max_col=12, min_row=assignee_table_row, max_row=assignee_table_end), titles_from_data=True)
-    assignee_bar.set_categories(Reference(ws, min_col=10, min_row=assignee_table_row + 1, max_row=assignee_table_end))
+    assignee_bar.y_axis.numFmt    = "0"
+    assignee_bar.y_axis.majorUnit = 1
+    assignee_bar.add_data(
+        Reference(ws, min_col=asgn_pend_col, max_col=asgn_ong_col,
+                  min_row=assignee_table_row, max_row=assignee_table_end),
+        titles_from_data=True,
+    )
+    assignee_bar.set_categories(
+        Reference(ws, min_col=asgn_label_col,
+                  min_row=assignee_table_row + 1, max_row=assignee_table_end),
+    )
     assignee_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
     assignee_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
     assignee_bar.height = 9
-    assignee_bar.width = 18
+    assignee_bar.width  = 18
     assignee_bar.x_axis.textRotation = -30
     assignee_bar.x_axis.delete = False
     assignee_bar.y_axis.delete = False
-    _dash_set_title(assignee_bar, size_pt=14)
+    _dash_set_title(assignee_bar,        size_pt=14)
     _dash_set_title(assignee_bar.y_axis, size_pt=10)
     ws.add_chart(assignee_bar, f"B{assignee_table_row}")
     row = max(row, assignee_table_row + 19) + 1
 
-    # Section 5: Ongoing tickets list sorted by days open
-    row = _dash_section_header(ws, row, f"Ongoing Tickets ({len(ongoing_list)}) — Sorted by Days Ongoing", span=7)
+    # ------------------------------------------------------------------
+    # Section 4: Ticket Worth Distribution bar chart
+    # ------------------------------------------------------------------
+    row = _dash_section_header(ws, row, "Ticket Worth Distribution ($)")
+    worth_table_row = row
+
+    # Data in hidden cols (Y, Z)
+    wbkt_label_col = 25
+    wbkt_count_col = 26
+    ws.cell(row=row, column=wbkt_label_col, value="Worth Range")
+    ws.cell(row=row, column=wbkt_count_col, value="Tickets")
+    row += 1
+    for _, _, label in WORTH_BUCKETS:
+        ws.cell(row=row, column=wbkt_label_col, value=label)
+        ws.cell(row=row, column=wbkt_count_col, value=worth_buckets[label])
+        row += 1
+    worth_table_end = row - 1
+
+    worth_bar = BarChart()
+    worth_bar.type     = "col"
+    worth_bar.grouping = "clustered"
+    worth_bar.title    = "Tickets by Worth ($)"
+    worth_bar.y_axis.title = "Number of Tickets"
+    worth_bar.y_axis.numFmt    = "0"
+    worth_bar.y_axis.majorUnit = 1
+    worth_bar.add_data(
+        Reference(ws, min_col=wbkt_count_col,
+                  min_row=worth_table_row, max_row=worth_table_end),
+        titles_from_data=True,
+    )
+    worth_bar.set_categories(
+        Reference(ws, min_col=wbkt_label_col,
+                  min_row=worth_table_row + 1, max_row=worth_table_end),
+    )
+    worth_bar.series[0].graphicalProperties.solidFill = "2E75B6"
+    worth_bar.height = 9
+    worth_bar.width  = 18
+    worth_bar.x_axis.delete = False
+    worth_bar.y_axis.delete = False
+    _dash_set_title(worth_bar,        size_pt=14)
+    _dash_set_title(worth_bar.y_axis, size_pt=10)
+    ws.add_chart(worth_bar, f"B{worth_table_row}")
+    row = max(row, worth_table_row + 19) + 1
+
+    # ------------------------------------------------------------------
+    # Section 5: Ongoing tickets list (with Worth column)
+    # ------------------------------------------------------------------
+    row = _dash_section_header(ws, row,
+        f"Ongoing Tickets ({len(ongoing_list)}) — Sorted by Days Ongoing", span=8)
     list_header_row = row
-    for i, h in enumerate(["Ticket #", "Subject", "Assignee", "Category", "Days Ongoing", "Sender"]):
+    for i, h in enumerate(["Ticket #", "Subject", "Assignee", "Category",
+                            "Days Ongoing", "Worth ($)", "Sender"]):
         c = ws.cell(row=row, column=2 + i, value=h)
         c.font = DASH_TABLE_HEADER_FONT
         c.fill = DASH_TABLE_HEADER_FILL
@@ -1235,12 +1451,14 @@ def update_dashboard(filepath):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     if not ongoing_list:
-        ws.cell(row=row, column=2, value="No tickets are currently Ongoing.").font = DASH_VALUE_FONT
+        ws.cell(row=row, column=2,
+                value="No tickets are currently Ongoing.").font = DASH_VALUE_FONT
         row += 1
     else:
         for t in ongoing_list:
-            values       = [t["num"], t["subject"], t["assigned_to"] or "Unassigned",
-                            t["category"], t["days_ongoing"], t["sender_email"]]
+            worth_disp = f"${t['worth']:.2f}" if t.get("worth", 0) > 0 else "—"
+            values     = [t["num"], t["subject"], t["assigned_to"] or "Unassigned",
+                          t["category"], t["days_ongoing"], worth_disp, t["sender_email"]]
             long_ongoing = t["days_ongoing"] >= 14
             row_fill     = DASH_URGENT_FILL if long_ongoing else PatternFill()
             for col_offset, val in enumerate(values):
@@ -1248,24 +1466,22 @@ def update_dashboard(filepath):
                 c.font   = Font(name="Arial", size=10, bold=long_ongoing)
                 c.fill   = row_fill
                 c.border = border
-                if col_offset in (0, 4):
+                if col_offset in (0, 4, 5):
                     c.alignment = Alignment(horizontal="center", vertical="top")
                 else:
                     c.alignment = Alignment(vertical="top", wrap_text=(col_offset == 1))
             row += 1
 
     ws.column_dimensions["A"].width = 2
-    ws.column_dimensions["B"].width = 30
-    ws.column_dimensions["C"].width = 38
-    ws.column_dimensions["D"].width = 28
-    ws.column_dimensions["E"].width = 35
-    ws.column_dimensions["F"].width = 13
-    ws.column_dimensions["G"].width = 30
-    ws.column_dimensions["J"].width = 32
-    ws.column_dimensions["K"].width = 10
-    ws.column_dimensions["L"].width = 10
+    ws.column_dimensions["B"].width = 10   # Ticket #
+    ws.column_dimensions["C"].width = 35   # Subject
+    ws.column_dimensions["D"].width = 22   # Assignee
+    ws.column_dimensions["E"].width = 28   # Category
+    ws.column_dimensions["F"].width = 13   # Days Ongoing
+    ws.column_dimensions["G"].width = 13   # Worth ($)
+    ws.column_dimensions["H"].width = 30   # Sender  /  also where cat chart starts
 
-    # Restore Inbox Tracker as active sheet so the file opens on the data sheet
+    # Restore Inbox Tracker as active sheet
     wb.active = wb.sheetnames.index("Inbox Tracker")
 
     try:
