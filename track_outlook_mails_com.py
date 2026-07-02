@@ -543,9 +543,6 @@ def extract_worth(body):
     return 0.0
 
 
-# AI — Status detection helpers
-
-
 # Assignee name extraction
 
 
@@ -1317,17 +1314,22 @@ def update_dashboard(filepath):
     cat_bar_worth.add_data(data_worth, titles_from_data=True)
     cat_bar_worth.set_categories(cats_ref)
     
-    # Create right-hand numerical axis instance linked to max crossing point
+    # Define secondary axis explicitly and associate it correctly before adding chart structures
     cat_bar_worth.y_axis = NumericAxis(axId=200, title="Total Worth ($)", crosses="max", majorGridlines=None)
     cat_bar_worth.y_axis.numFmt = '"$"#,##0'
+    cat_bar_worth.x_axis = cat_bar.x_axis  # Must share the identical X-Axis relation
     
-    # Merge structural series configurations inside parent chart object
+    # Bind the second axis reference to the top level chart layout
+    cat_bar.y_axis.axId = 100
+    cat_bar_worth.y_axis.crosses = "max"
+    
+    # Combine charts safely
     cat_bar += cat_bar_worth
     
-    # Explicit series coloring mapped to specific metrics
-    cat_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]  # FFC000
-    cat_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]  # 5B9BD5
-    cat_bar.series[2].graphicalProperties.solidFill = "2E75B6"                       # Worth Fill
+    # Explicit series color mapping after combination to secure openpyxl series bindings
+    cat_bar.series[0].graphicalProperties.solidFill = STATUS_COLORS["Pending"]   # FFF2CC
+    cat_bar.series[1].graphicalProperties.solidFill = STATUS_COLORS["Ongoing"]   # DDEEFF
+    cat_bar.series[2].graphicalProperties.solidFill = "2E75B6"                       # Deep TechOps Blue for Worth
     
     cat_bar.height = 9
     cat_bar.width  = 18
@@ -1361,8 +1363,8 @@ def update_dashboard(filepath):
         Reference(dws, min_col=8,
                   min_row=ASGN_ROW + 1, max_row=asgn_end),
     )
-    assignee_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
-    assignee_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
+    assignee_bar.series[0].graphicalProperties.solidFill = STATUS_COLORS["Pending"]
+    assignee_bar.series[1].graphicalProperties.solidFill = STATUS_COLORS["Ongoing"]
     assignee_bar.height = 9
     assignee_bar.width  = 18
     assignee_bar.x_axis.textRotation = -30
