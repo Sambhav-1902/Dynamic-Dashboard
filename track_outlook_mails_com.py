@@ -1348,14 +1348,14 @@ def update_dashboard(filepath):
     )
     for bi, color in enumerate(WORTH_BRACKET_COLORS):
         cat_brkt_bar.series[bi].graphicalProperties.solidFill = color
-    cat_brkt_bar.height = 9
-    cat_brkt_bar.width  = 20
+    cat_brkt_bar.height = 10
+    cat_brkt_bar.width  = 22
     cat_brkt_bar.x_axis.textRotation = -30
     cat_brkt_bar.x_axis.delete = False
     cat_brkt_bar.y_axis.delete = False
     from openpyxl.chart.legend import Legend
     cat_brkt_bar.legend = Legend()
-    cat_brkt_bar.legend.position = "b"  # bottom — away from bars
+    cat_brkt_bar.legend.position = "r"  # right side — clear of bars and category names
     _dash_set_title(cat_brkt_bar,        size_pt=14)
     _dash_set_title(cat_brkt_bar.y_axis, size_pt=10)
     ws.add_chart(cat_brkt_bar, f"F{charts_row}")
