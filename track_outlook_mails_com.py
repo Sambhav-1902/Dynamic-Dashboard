@@ -1349,13 +1349,13 @@ def update_dashboard(filepath):
     for bi, color in enumerate(WORTH_BRACKET_COLORS):
         cat_brkt_bar.series[bi].graphicalProperties.solidFill = color
     cat_brkt_bar.height = 9
-    cat_brkt_bar.width  = 26
+    cat_brkt_bar.width  = 22
     cat_brkt_bar.x_axis.textRotation = -30
     cat_brkt_bar.x_axis.delete = False
     cat_brkt_bar.y_axis.delete = False
     from openpyxl.chart.legend import Legend
     cat_brkt_bar.legend = Legend()
-    cat_brkt_bar.legend.position = "r"  # right side — clear of bars and category names
+    cat_brkt_bar.legend.position = "r"
     _dash_set_title(cat_brkt_bar,        size_pt=14)
     _dash_set_title(cat_brkt_bar.y_axis, size_pt=10)
     ws.add_chart(cat_brkt_bar, f"F{charts_row}")
@@ -1483,6 +1483,43 @@ def update_dashboard(filepath):
     except PermissionError:
         print("Could not save dashboard — Excel is open.")
         return False
+
+    # Patch the category-worth chart XML directly to inject a manualLayout
+    # on the plot area — openpyxl sets the object correctly in memory but
+    # doesn't serialise it to XML, so the legend still overlaps the bars.
+    # The patch constrains the plot area to 75% of chart width, leaving
+    # the right 25% clear for the legend.
+    try:
+        import zipfile, shutil, os, re as _re
+        tmp = filepath + ".tmp"
+        with zipfile.ZipFile(filepath, 'r') as zin, \
+             zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.endswith('.xml') and b'Category' in data and b'Worth' in data \
+                        and data.count(b'<ser>') >= 4:
+                    # This is the category-worth chart — inject manualLayout
+                    xml = data.decode('utf-8')
+                    layout_xml = (
+                        '<layout>'
+                        '<manualLayout>'
+                        '<layoutTarget val="inner"/>'
+                        '<xMode val="factor"/>'
+                        '<yMode val="factor"/>'
+                        '<x val="0"/>'
+                        '<y val="0"/>'
+                        '<w val="0.75"/>'
+                        '<h val="1"/>'
+                        '</manualLayout>'
+                        '</layout>'
+                    )
+                    # Insert after <plotArea> opening tag
+                    xml = xml.replace('<plotArea>', '<plotArea>' + layout_xml, 1)
+                    data = xml.encode('utf-8')
+                zout.writestr(item, data)
+        shutil.move(tmp, filepath)
+    except Exception as e:
+        print(f"Note: could not patch chart layout ({e}) — legend may overlap in some renderers.")
 
     return True
 
