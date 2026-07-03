@@ -1348,8 +1348,8 @@ def update_dashboard(filepath):
     )
     for bi, color in enumerate(WORTH_BRACKET_COLORS):
         cat_brkt_bar.series[bi].graphicalProperties.solidFill = color
-    cat_brkt_bar.height = 10
-    cat_brkt_bar.width  = 22
+    cat_brkt_bar.height = 9
+    cat_brkt_bar.width  = 26
     cat_brkt_bar.x_axis.textRotation = -30
     cat_brkt_bar.x_axis.delete = False
     cat_brkt_bar.y_axis.delete = False
