@@ -1353,6 +1353,9 @@ def update_dashboard(filepath):
     cat_brkt_bar.x_axis.textRotation = -30
     cat_brkt_bar.x_axis.delete = False
     cat_brkt_bar.y_axis.delete = False
+    from openpyxl.chart.legend import Legend
+    cat_brkt_bar.legend = Legend()
+    cat_brkt_bar.legend.position = "b"  # bottom — away from bars
     _dash_set_title(cat_brkt_bar,        size_pt=14)
     _dash_set_title(cat_brkt_bar.y_axis, size_pt=10)
     ws.add_chart(cat_brkt_bar, f"F{charts_row}")
