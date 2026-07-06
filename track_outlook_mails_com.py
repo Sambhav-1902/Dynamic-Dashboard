@@ -1006,11 +1006,8 @@ def load_historical_emails_com(inbox, allowed_senders, retry_queue):
 
     for i, (eid, em) in enumerate(emails, 1):
         print(f"[{i}/{len(emails)}] {em['subject']} — from {em['sender_email']}")
-        if not is_allowed(em["sender_email"], allowed_senders):
-            print(f"   Ignored (not in allowed list)")
-            continue
-        if not is_dl_email(em):
-            print(f"   Ignored (DL address not in To/CC/BCC)")
+        if not is_allowed(em["sender_email"], allowed_senders) and not is_dl_email(em):
+            print(f"   Ignored (sender unknown and DL not in To/CC/BCC)")
             continue
         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
         process_email(em, retry_queue, OUTPUT_FILE)
@@ -1641,11 +1638,8 @@ def listen():
                 for eid in new_ids:
                     em = fetch_item_by_entry_id(namespace, eid)
                     if em:
-                        if not is_allowed(em["sender_email"], allowed_senders):
-                            print(f"Ignored: {em['sender_email']} (not in allowed list)")
-                            continue
-                        if not is_dl_email(em):
-                            print(f"Ignored: {em['sender_email']} (DL not in To/CC/BCC)")
+                        if not is_allowed(em["sender_email"], allowed_senders) and not is_dl_email(em):
+                            print(f"Ignored: {em['sender_email']} (sender unknown and DL not in To/CC/BCC)")
                             continue
                         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
                         process_email(em, retry_queue, OUTPUT_FILE)
