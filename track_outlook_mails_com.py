@@ -119,6 +119,10 @@ ALLOWED_DOMAINS = [
     # "exlservice.com",
 ]
 
+# Only process emails that were sent to or CC'd/BCC'd to this DL address.
+# Emails that don't involve this address at all are ignored.
+DL_ADDRESS = "support@exlservice.com"
+
 
 # Allowed senders management
 
@@ -163,6 +167,16 @@ def extract_and_update_senders(msg, current_allowed):
 
 def is_allowed(sender_email, allowed_senders):
     return sender_email.lower().strip() in allowed_senders
+
+
+def is_dl_email(em):
+    """Returns True if the DL address appears as a whole address in To/CC/BCC.
+    Uses word-boundary matching so 'notsupport@exlservice.com' does NOT match."""
+    import re as _re
+    to_cc_bcc = em.get("to_cc_bcc", "")
+    # Split on common separators and check each address individually
+    addresses = _re.split(r'[\s;,<>]+', to_cc_bcc)
+    return DL_ADDRESS.lower() in addresses
 
 
 # Email parsing (COM version)
@@ -272,6 +286,14 @@ def parse_email_com(item):
         "in_reply_to":  in_reply_to,
         "raw_msg":      msg,
         "_entry_id":    getattr(item, "EntryID", None),
+        "to_cc_bcc":    " ".join(filter(None, [
+            msg.get("To", ""),
+            msg.get("Cc", ""),
+            msg.get("Bcc", ""),
+            getattr(item, "To", "") or "",
+            getattr(item, "CC", "") or "",
+            getattr(item, "BCC", "") or "",
+        ])).lower(),
     }
 
 
@@ -987,6 +1009,9 @@ def load_historical_emails_com(inbox, allowed_senders, retry_queue):
         if not is_allowed(em["sender_email"], allowed_senders):
             print(f"   Ignored (not in allowed list)")
             continue
+        if not is_dl_email(em):
+            print(f"   Ignored (DL address not in To/CC/BCC)")
+            continue
         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
         process_email(em, retry_queue, OUTPUT_FILE)
 
@@ -1618,6 +1643,9 @@ def listen():
                     if em:
                         if not is_allowed(em["sender_email"], allowed_senders):
                             print(f"Ignored: {em['sender_email']} (not in allowed list)")
+                            continue
+                        if not is_dl_email(em):
+                            print(f"Ignored: {em['sender_email']} (DL not in To/CC/BCC)")
                             continue
                         allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
                         process_email(em, retry_queue, OUTPUT_FILE)
