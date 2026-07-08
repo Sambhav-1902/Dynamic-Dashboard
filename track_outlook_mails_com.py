@@ -841,6 +841,226 @@ def update_existing_row(em, target_row, filepath):
 # Email routing
 
 
+def parse_quoted_chain(body):
+    """Parses an Outlook quoted email chain from a reply body.
+
+    Splits the body into individual messages using the standard Outlook
+    '-----Original Message-----' separator, extracting From, Sent, To,
+    and message text for each quoted block.
+
+    Returns a list of dicts oldest-first:
+        [{"sender_email": ..., "sender_name": ..., "timestamp": ..., "body": ...}, ...]
+
+    The list does NOT include Pankaj's own reply text (the top of the email) —
+    only the quoted messages beneath it. Returns empty list if no quoted chain found.
+    """
+    # Split on the standard Outlook original message separator
+    separator = re.compile(
+        r'-{3,}\s*Original Message\s*-{3,}|'   # -----Original Message-----
+        r'-{3,}\s*Forwarded Message\s*-{3,}',  # -----Forwarded Message-----
+        re.IGNORECASE
+    )
+    parts = separator.split(body)
+
+    if len(parts) <= 1:
+        # Try the "On <date>, <name> wrote:" format as fallback
+        on_wrote = re.compile(
+            r'\nOn\s+.{5,80}wrote:\s*\n',
+            re.IGNORECASE | re.DOTALL
+        )
+        splits = on_wrote.split(body)
+        headers = on_wrote.findall(body)
+        if len(splits) <= 1:
+            return []
+        # Build pseudo-parts: no header for the first split, then pair header+content
+        parts = [splits[0]]
+        for i, hdr in enumerate(headers):
+            parts.append(hdr + (splits[i + 1] if i + 1 < len(splits) else ""))
+
+    messages = []
+    for part in parts[1:]:  # skip parts[0] — that's Pankaj's own reply
+        part = part.strip()
+        if not part:
+            continue
+
+        # Extract From:
+        from_match = re.search(r'^From:\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
+        # Extract Sent: / Date:
+        sent_match = re.search(r'^(?:Sent|Date):\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
+        # Extract message body — everything after the header block
+        # Header block ends after the Subject: line
+        subj_match = re.search(r'^Subject:\s*.+$', part, re.MULTILINE | re.IGNORECASE)
+        if subj_match:
+            msg_body = part[subj_match.end():].strip()
+        else:
+            # Fall back: skip lines that look like headers
+            lines = part.split('\n')
+            header_done = False
+            body_lines = []
+            for line in lines:
+                if not header_done:
+                    if re.match(r'^(From|Sent|Date|To|Cc|Subject):', line, re.IGNORECASE):
+                        continue
+                    else:
+                        header_done = True
+                if header_done:
+                    body_lines.append(line)
+            msg_body = '\n'.join(body_lines).strip()
+
+        # Parse sender from From: header
+        sender_name = ""
+        sender_email = ""
+        if from_match:
+            from_raw = from_match.group(1).strip()
+            # Try "Name <email>" format
+            angle = re.search(r'<([^>]+)>', from_raw)
+            if angle:
+                sender_email = angle.group(1).strip().lower()
+                sender_name  = from_raw[:from_raw.find('<')].strip().strip('"')
+            else:
+                # Plain email address
+                _, addr = parseaddr(from_raw)
+                sender_email = addr.lower().strip() if addr else from_raw.lower().strip()
+                sender_name  = sender_email
+
+        # Parse timestamp from Sent/Date header
+        timestamp = ""
+        if sent_match:
+            try:
+                from email.utils import parsedate_to_datetime as _p2dt
+                dt = _p2dt(sent_match.group(1).strip())
+                timestamp = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                # Try parsedatetime as fallback
+                try:
+                    result, status = _cal.parseDT(sent_match.group(1).strip(), datetime.now())
+                    if status != 0:
+                        timestamp = result.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    timestamp = ""
+
+        if sender_email or msg_body:
+            messages.append({
+                "sender_name":  sender_name,
+                "sender_email": sender_email,
+                "timestamp":    timestamp,
+                "body":         msg_body,
+            })
+
+    return messages[::-1]  # reverse so oldest message is first (index 0)
+
+
+def append_midchain_email(em, filepath):
+    """Creates a ticket from an email where an employee CCed the DL mid-conversation.
+
+    Parses the quoted chain in the body to reconstruct the full history:
+    - Sender/name/received time come from the OLDEST quoted message (original client)
+    - Subject stripped of Re:/Fwd: prefixes
+    - Status set to Ongoing (employee has already replied)
+    - Ongoing Since set to Pankaj's reply time
+    - Assignee set to Pankaj (the employee who CCed the DL)
+    - Followups = number of client messages before first employee reply
+    - Category/worth/due date detected from the full chain body
+    - Body stores the full reconstructed conversation oldest-first
+    """
+    chain = parse_quoted_chain(em["body"])
+
+    if not chain:
+        # Can't parse the chain — fall back to treating it as a normal new ticket
+        # but set status to Ongoing since we know an employee replied
+        print("   Could not parse quoted chain — saving with available info.")
+        saved = append_new_email(em, filepath)
+        if saved:
+            # Patch the status to Ongoing since Pankaj already replied
+            try:
+                wb = openpyxl.load_workbook(filepath)
+                ws = wb["Inbox Tracker"]
+                last_row = ws.max_row
+                ws.cell(row=last_row, column=COL_STATUS).value = "Ongoing"
+                apply_status_color(ws.cell(row=last_row, column=COL_STATUS), "Ongoing")
+                ws.cell(row=last_row, column=COL_ONGOING_SINCE).value = em["received"]
+                ws.cell(row=last_row, column=COL_ASSIGNED_TO).value = \
+                    extract_assignee_name(em["sender_name"], em["sender_email"], "")
+                wb.save(filepath)
+            except Exception:
+                pass
+        return saved
+
+    # Oldest message = original client email
+    original = chain[0]
+
+    # Determine the original client's email (non-employee sender)
+    # It's whoever sent the oldest message
+    client_email = original["sender_email"]
+    client_name  = original["sender_name"] or client_email
+    received_dt  = original["timestamp"] or em["received"]
+
+    # Build full conversation body oldest-first, then append Pankaj's reply
+    full_body_parts = []
+    for msg in chain:
+        ts   = msg["timestamp"] or "unknown time"
+        sndr = msg["sender_email"] or "unknown"
+        full_body_parts.append(f"[{ts}] {sndr}:\n{msg['body'].strip()}")
+    # Pankaj's own reply text (top of the email, above the quoted chain)
+    pankaj_text = strip_quoted_content(em["body"]).strip()
+    full_body_parts.append(f"[{em['received']}] {em['sender_email']}:\n{pankaj_text}")
+    full_body = "\n\n---\n\n".join(full_body_parts)
+
+    # Collect all text for AI detection
+    all_text = " ".join(msg["body"] for msg in chain) + " " + pankaj_text
+
+    category = detect_categories(original["body"] or all_text)
+    due_date = extract_deadline(all_text)
+    worth    = extract_worth(all_text)
+
+    # Count followups: client messages before the first employee reply
+    # An "employee message" is any message NOT from the client
+    followups = 0
+    first_reply_seen = False
+    for msg in chain[1:]:  # skip the first client message
+        if not first_reply_seen:
+            if msg["sender_email"] != client_email:
+                first_reply_seen = True
+            else:
+                followups += 1
+        # After first employee reply, stop counting
+
+    # Assignee = Pankaj
+    assignee = extract_assignee_name(em["sender_name"], em["sender_email"], "")
+
+    try:
+        wb       = openpyxl.load_workbook(filepath)
+        ws       = wb["Inbox Tracker"]
+        next_row = ws.max_row + 1
+        index    = next_row - 1
+
+        alt_fill = PatternFill("solid", start_color="DCE6F1")
+        row_fill = alt_fill if index % 2 == 0 else PatternFill()
+
+        values = [
+            index, client_name, client_email, clean_subject(em["subject"]),
+            category, received_dt, em["received"],
+            "Ongoing", em["received"],   # status=Ongoing, ongoing_since=Pankaj's reply time
+            assignee, followups, due_date,
+            full_body[:10000], em["message_id"],
+            worth if worth > 0 else "",
+        ]
+
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row=next_row, column=col, value=value)
+            cell.font      = Font(name="Arial", size=10)
+            cell.fill      = row_fill
+            cell.alignment = Alignment(vertical="top", wrap_text=(col == COL_BODY))
+
+        apply_status_color(ws.cell(row=next_row, column=COL_STATUS), "Ongoing")
+        ws.cell(row=next_row, column=COL_FOLLOWUPS).alignment = Alignment(horizontal="center", vertical="top")
+
+        wb.save(filepath)
+        return True
+    except PermissionError:
+        return False
+
+
 def process_email(em, retry_queue, filepath):
     """Routes an incoming email to either update an existing ticket or create a new one."""
     if em["in_reply_to"]:
@@ -864,10 +1084,15 @@ def process_email(em, retry_queue, filepath):
                 retry_queue.append(em)
                 print(f"Excel open — reply queued: '{em['subject']}'\n")
         else:
-            print(f"Reply with no matching ticket — saving as new.")
-            saved = append_new_email(em, filepath)
+            # Reply with no matching parent — employee CCed the DL mid-conversation.
+            # Parse the quoted chain to reconstruct the full ticket history.
+            print(f"Reply with no matching ticket — parsing quoted chain.")
+            saved = append_midchain_email(em, filepath)
             if not saved:
                 retry_queue.append(em)
+                print(f"   Excel open — queued.")
+            else:
+                print(f"   Mid-chain ticket saved: '{clean_subject(em['subject'])}'\n")
     else:
         saved = append_new_email(em, filepath)
         if not saved:
