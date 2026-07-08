@@ -265,7 +265,7 @@ def parse_email_com(item):
             body = strip_html(item.HTMLBody or "")
         except Exception:
             pass
-    body = body.strip()[:2000]
+    body = body.strip()
 
     message_id  = msg.get("Message-ID", "").strip()
     in_reply_to = msg.get("In-Reply-To", "").strip()
@@ -571,11 +571,18 @@ def extract_worth(body):
 
 
 def extract_assignee_name(sender_name, sender_email, body):
-    """Extracts the assignee name. Tries sender name first, then email prefix, then GLiNER."""
+    """Extracts the assignee name. Only returns a name if the sender is an
+    EXL employee (@exlservice.com domain) — clients are never set as assignees."""
+
+    # Only employees can be assignees
+    if not sender_email or "@exlservice.com" not in sender_email.lower():
+        return ""
+
+    skip = ["noreply", "no-reply", "support", "team", "system",
+            "notification", "alert", "admin", "info", "do-not-reply"]
+
     if sender_name and sender_name.strip():
         name = sender_name.strip()
-        skip = ["noreply", "no-reply", "support", "team", "system",
-                "notification", "alert", "admin", "info", "do-not-reply"]
         if not any(kw in name.lower() for kw in skip):
             return name
 
@@ -584,16 +591,8 @@ def extract_assignee_name(sender_name, sender_email, body):
         local_part = re.sub(r'^(ex_|usr_|emp_|user_|staff_)', '', local_part, flags=re.IGNORECASE)
         local_part = re.sub(r'[._-]', ' ', local_part)
         local_part = re.sub(r'\d+', '', local_part).strip()
-        if local_part:
+        if local_part and not any(kw in local_part.lower() for kw in skip):
             return local_part.title()
-
-    if body and body.strip():
-        try:
-            entities = deadline_model.predict_entities(get_first_300_words(body), ["person name"], threshold=0.4)
-            if entities:
-                return entities[0]["text"].strip().title()
-        except Exception as e:
-            print(f"Name extraction error: {e}")
 
     return ""
 
@@ -788,8 +787,6 @@ def update_existing_row(em, target_row, filepath):
             print(f"   Reply from someone else — running resolution check...")
             resolved = is_conversation_resolved(combined_body, original_sender)
             status   = "Resolved" if resolved else "Ongoing"
-
-        combined_body = combined_body[:10000]
 
         ws.cell(row=target_row, column=COL_BODY).value            = combined_body
         ws.cell(row=target_row, column=COL_BODY).alignment        = Alignment(vertical="top", wrap_text=True)
@@ -1027,7 +1024,7 @@ def append_midchain_email(em, filepath):
             category, received_dt, em["received"],
             "Ongoing", em["received"],   # status=Ongoing, ongoing_since=Pankaj's reply time
             assignee, followups, due_date,
-            full_body[:10000], em["message_id"],
+            full_body, em["message_id"],
             worth if worth > 0 else "",
         ]
 
