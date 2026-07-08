@@ -844,96 +844,94 @@ def update_existing_row(em, target_row, filepath):
 def parse_quoted_chain(body):
     """Parses an Outlook quoted email chain from a reply body.
 
-    Splits the body into individual messages using the standard Outlook
-    '-----Original Message-----' separator, extracting From, Sent, To,
-    and message text for each quoted block.
+    Handles the most common Outlook quote formats:
+    - Underscore line separator (________________________________)
+    - Dash line separator (-----Original Message-----)
+    - "On <date>, <name> wrote:" format
 
-    Returns a list of dicts oldest-first:
+    Returns a list of message dicts oldest-first:
         [{"sender_email": ..., "sender_name": ..., "timestamp": ..., "body": ...}, ...]
 
-    The list does NOT include Pankaj's own reply text (the top of the email) —
-    only the quoted messages beneath it. Returns empty list if no quoted chain found.
+    Does NOT include the top-level reply text — only the quoted messages below it.
+    Returns empty list if no quoted chain found.
     """
-    # Split on the standard Outlook original message separator
+    # Match any of the common Outlook separators:
+    # 1. A line of 10+ underscores (most common in corporate Outlook)
+    # 2. -----Original Message----- or -----Forwarded Message-----
+    # 3. A line of 10+ dashes alone on a line
     separator = re.compile(
-        r'-{3,}\s*Original Message\s*-{3,}|'   # -----Original Message-----
-        r'-{3,}\s*Forwarded Message\s*-{3,}',  # -----Forwarded Message-----
+        r'\n_{10,}\n|'                              # ________________________________
+        r'\n-{10,}\n|'                              # ---------------------------
+        r'\n-{3,}\s*(?:Original|Forwarded)\s+Message\s*-{3,}\n|'  # -----Original Message-----
+        r'\nOn\s+.{5,120}?wrote:\s*\n',            # On <date>, <name> wrote:
         re.IGNORECASE
     )
+
     parts = separator.split(body)
+    separators_found = separator.findall(body)
 
     if len(parts) <= 1:
-        # Try the "On <date>, <name> wrote:" format as fallback
-        on_wrote = re.compile(
-            r'\nOn\s+.{5,80}wrote:\s*\n',
-            re.IGNORECASE | re.DOTALL
-        )
-        splits = on_wrote.split(body)
-        headers = on_wrote.findall(body)
-        if len(splits) <= 1:
-            return []
-        # Build pseudo-parts: no header for the first split, then pair header+content
-        parts = [splits[0]]
-        for i, hdr in enumerate(headers):
-            parts.append(hdr + (splits[i + 1] if i + 1 < len(splits) else ""))
+        return []
 
     messages = []
-    for part in parts[1:]:  # skip parts[0] — that's Pankaj's own reply
+    for part in parts[1:]:  # parts[0] is the top-level reply — skip it
         part = part.strip()
         if not part:
             continue
 
-        # Extract From:
+        # Parse From: — handles both "Name <email>" and plain "email" formats
         from_match = re.search(r'^From:\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
-        # Extract Sent: / Date:
+
+        # Parse Sent: or Date:
         sent_match = re.search(r'^(?:Sent|Date):\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
-        # Extract message body — everything after the header block
-        # Header block ends after the Subject: line
-        subj_match = re.search(r'^Subject:\s*.+$', part, re.MULTILINE | re.IGNORECASE)
-        if subj_match:
-            msg_body = part[subj_match.end():].strip()
+
+        # Find where the header block ends — after the last recognisable header line
+        # Headers: From, Sent, Date, To, Cc, Bcc, Subject
+        header_pattern = re.compile(
+            r'^(?:From|Sent|Date|To|Cc|Bcc|Subject)\s*:.*$',
+            re.MULTILINE | re.IGNORECASE
+        )
+        header_matches = list(header_pattern.finditer(part))
+        if header_matches:
+            last_header_end = header_matches[-1].end()
+            msg_body = part[last_header_end:].strip()
         else:
-            # Fall back: skip lines that look like headers
-            lines = part.split('\n')
-            header_done = False
-            body_lines = []
-            for line in lines:
-                if not header_done:
-                    if re.match(r'^(From|Sent|Date|To|Cc|Subject):', line, re.IGNORECASE):
-                        continue
-                    else:
-                        header_done = True
-                if header_done:
-                    body_lines.append(line)
-            msg_body = '\n'.join(body_lines).strip()
+            msg_body = part.strip()
 
         # Parse sender from From: header
-        sender_name = ""
+        sender_name  = ""
         sender_email = ""
         if from_match:
             from_raw = from_match.group(1).strip()
-            # Try "Name <email>" format
+            # "Name <email>" format
             angle = re.search(r'<([^>]+)>', from_raw)
             if angle:
                 sender_email = angle.group(1).strip().lower()
                 sender_name  = from_raw[:from_raw.find('<')].strip().strip('"')
             else:
-                # Plain email address
+                # Try parseaddr
                 _, addr = parseaddr(from_raw)
-                sender_email = addr.lower().strip() if addr else from_raw.lower().strip()
-                sender_name  = sender_email
+                if addr:
+                    sender_email = addr.lower().strip()
+                    sender_name  = from_raw.replace(addr, "").strip().strip('"')
+                else:
+                    sender_email = from_raw.lower().strip()
+                    sender_name  = sender_email
 
-        # Parse timestamp from Sent/Date header
+        # Parse timestamp — handles multiple date formats:
+        # "06 July 2026 16:13", "Monday, July 6, 2026 4:13 PM", standard RFC formats
         timestamp = ""
         if sent_match:
+            raw_date = sent_match.group(1).strip()
+            # Try standard email date format first
             try:
                 from email.utils import parsedate_to_datetime as _p2dt
-                dt = _p2dt(sent_match.group(1).strip())
+                dt = _p2dt(raw_date)
                 timestamp = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                # Try parsedatetime as fallback
+                # Fall back to parsedatetime (handles "06 July 2026 16:13" etc.)
                 try:
-                    result, status = _cal.parseDT(sent_match.group(1).strip(), datetime.now())
+                    result, status = _cal.parseDT(raw_date, datetime.now())
                     if status != 0:
                         timestamp = result.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
