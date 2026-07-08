@@ -842,74 +842,64 @@ def update_existing_row(em, target_row, filepath):
 
 
 def parse_quoted_chain(body):
-    """Parses an Outlook quoted email chain from a reply body.
+    """Parses an Outlook quoted email chain by finding From/Sent/To/Subject
+    header blocks directly — no separator matching needed.
 
-    Handles the most common Outlook quote formats:
-    - Underscore line separator (________________________________)
-    - Dash line separator (-----Original Message-----)
-    - "On <date>, <name> wrote:" format
+    Works with any Outlook format (underscores, dashes, no separator at all)
+    because it looks for the structured header block pattern itself.
 
     Returns a list of message dicts oldest-first:
         [{"sender_email": ..., "sender_name": ..., "timestamp": ..., "body": ...}, ...]
-
-    Does NOT include the top-level reply text — only the quoted messages below it.
-    Returns empty list if no quoted chain found.
+    Returns empty list if no quoted messages found.
     """
-    # Match any of the common Outlook separators:
-    # 1. A line of 10+ underscores (most common in corporate Outlook)
-    # 2. -----Original Message----- or -----Forwarded Message-----
-    # 3. A line of 10+ dashes alone on a line
-    separator = re.compile(
-        r'\n_{10,}\n|'                              # ________________________________
-        r'\n-{10,}\n|'                              # ---------------------------
-        r'\n-{3,}\s*(?:Original|Forwarded)\s+Message\s*-{3,}\n|'  # -----Original Message-----
-        r'\nOn\s+.{5,120}?wrote:\s*\n',            # On <date>, <name> wrote:
-        re.IGNORECASE
-    )
+    # Find all positions where a From: line starts a header block.
+    # A valid quoted block starts with "From:" and is followed within
+    # a few lines by at least one of Sent/Date/To/Subject.
+    from_positions = [m.start() for m in re.finditer(
+        r'^From\s*:', body, re.MULTILINE | re.IGNORECASE
+    )]
 
-    parts = separator.split(body)
-    separators_found = separator.findall(body)
-
-    if len(parts) <= 1:
+    if not from_positions:
         return []
 
     messages = []
-    for part in parts[1:]:  # parts[0] is the top-level reply — skip it
-        part = part.strip()
-        if not part:
+    for i, pos in enumerate(from_positions):
+        # Extract the block from this From: to the next From: (or end of body)
+        next_pos = from_positions[i + 1] if i + 1 < len(from_positions) else len(body)
+        block = body[pos:next_pos].strip()
+
+        # Must have at least one of Sent/Date/Subject to be a real email header
+        # (filters out "From:" appearing inside normal email body text)
+        has_sent    = bool(re.search(r'^(?:Sent|Date)\s*:', block, re.MULTILINE | re.IGNORECASE))
+        has_subject = bool(re.search(r'^Subject\s*:', block, re.MULTILINE | re.IGNORECASE))
+        if not (has_sent or has_subject):
             continue
 
-        # Parse From: — handles both "Name <email>" and plain "email" formats
-        from_match = re.search(r'^From:\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
+        # Parse From:
+        from_match = re.search(r'^From\s*:\s*(.+)$', block, re.MULTILINE | re.IGNORECASE)
+        sent_match = re.search(r'^(?:Sent|Date)\s*:\s*(.+)$', block, re.MULTILINE | re.IGNORECASE)
 
-        # Parse Sent: or Date:
-        sent_match = re.search(r'^(?:Sent|Date):\s*(.+)$', part, re.MULTILINE | re.IGNORECASE)
-
-        # Find where the header block ends — after the last recognisable header line
-        # Headers: From, Sent, Date, To, Cc, Bcc, Subject
+        # Body = everything after the last header line
         header_pattern = re.compile(
             r'^(?:From|Sent|Date|To|Cc|Bcc|Subject)\s*:.*$',
             re.MULTILINE | re.IGNORECASE
         )
-        header_matches = list(header_pattern.finditer(part))
+        header_matches = list(header_pattern.finditer(block))
         if header_matches:
-            last_header_end = header_matches[-1].end()
-            msg_body = part[last_header_end:].strip()
+            msg_body = block[header_matches[-1].end():].strip()
         else:
-            msg_body = part.strip()
+            msg_body = ""
 
-        # Parse sender from From: header
+        # Parse sender
         sender_name  = ""
         sender_email = ""
         if from_match:
             from_raw = from_match.group(1).strip()
-            # "Name <email>" format
             angle = re.search(r'<([^>]+)>', from_raw)
             if angle:
                 sender_email = angle.group(1).strip().lower()
                 sender_name  = from_raw[:from_raw.find('<')].strip().strip('"')
             else:
-                # Try parseaddr
                 _, addr = parseaddr(from_raw)
                 if addr:
                     sender_email = addr.lower().strip()
@@ -918,18 +908,15 @@ def parse_quoted_chain(body):
                     sender_email = from_raw.lower().strip()
                     sender_name  = sender_email
 
-        # Parse timestamp — handles multiple date formats:
-        # "06 July 2026 16:13", "Monday, July 6, 2026 4:13 PM", standard RFC formats
+        # Parse timestamp
         timestamp = ""
         if sent_match:
             raw_date = sent_match.group(1).strip()
-            # Try standard email date format first
             try:
                 from email.utils import parsedate_to_datetime as _p2dt
                 dt = _p2dt(raw_date)
                 timestamp = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                # Fall back to parsedatetime (handles "06 July 2026 16:13" etc.)
                 try:
                     result, status = _cal.parseDT(raw_date, datetime.now())
                     if status != 0:
@@ -937,7 +924,7 @@ def parse_quoted_chain(body):
                 except Exception:
                     timestamp = ""
 
-        if sender_email or msg_body:
+        if sender_email:
             messages.append({
                 "sender_name":  sender_name,
                 "sender_email": sender_email,
@@ -945,7 +932,7 @@ def parse_quoted_chain(body):
                 "body":         msg_body,
             })
 
-    return messages[::-1]  # reverse so oldest message is first (index 0)
+    return messages[::-1]  # oldest first
 
 
 def append_midchain_email(em, filepath):
