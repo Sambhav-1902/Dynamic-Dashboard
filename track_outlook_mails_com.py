@@ -712,6 +712,12 @@ def append_new_email(em, filepath):
     try:
         wb       = openpyxl.load_workbook(filepath)
         ws       = wb["Inbox Tracker"]
+
+        # Duplicate check — skip if this Message-ID already exists
+        if em["message_id"] and em["message_id"] in get_all_message_ids(ws):
+            print(f"   Skipping duplicate: '{em['subject']}'")
+            return "duplicate"
+
         next_row = ws.max_row + 1
         index    = next_row - 1
 
@@ -1013,6 +1019,12 @@ def append_midchain_email(em, filepath):
     try:
         wb       = openpyxl.load_workbook(filepath)
         ws       = wb["Inbox Tracker"]
+
+        # Duplicate check
+        if em["message_id"] and em["message_id"] in get_all_message_ids(ws):
+            print(f"   Skipping duplicate mid-chain: '{em['subject']}'")
+            return "duplicate"
+
         next_row = ws.max_row + 1
         index    = next_row - 1
 
@@ -1789,10 +1801,24 @@ def listen():
 
     print(f"Listening — checking every {POLL_INTERVAL}s. Press Ctrl+C to stop.\n")
 
+    # Path to the stop file created by server.py when Stop button is clicked
+    STOP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tracker_stop")
+
     while True:
         try:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
+
+            # Check if server.py has requested a clean stop
+            if os.path.exists(STOP_FILE):
+                os.remove(STOP_FILE)
+                print("\nStop requested — updating dashboard before stopping...")
+                if update_dashboard(OUTPUT_FILE):
+                    print("Dashboard updated.")
+                else:
+                    print("Could not update dashboard.")
+                print("Stopped.")
+                break
 
             # Retry any emails that failed because Excel was open
             if retry_queue:
