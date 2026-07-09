@@ -12,7 +12,7 @@ Run:
     python server.py
 
 The server listens on port 5000. Leave this terminal window open.
-The webpage at index.html connects to http://192.168.100.209:5000
+The webpage at index.html connects to http://EXLAPLPX4dnzrAk:5000
 """
 
 import subprocess
@@ -103,6 +103,6 @@ def stop():
 if __name__ == "__main__":
     print("TechOps Tracker Server starting...")
     print(f"Script path: {SCRIPT_PATH}")
-    print("Listening on http://192.168.100.209:5000")
+    print("Listening on http://EXLAPLPX4dnzrAk:5000")
     print("Keep this window open. Press Ctrl+C to shut down the server.\n")
     app.run(host="0.0.0.0", port=5000, debug=False)
