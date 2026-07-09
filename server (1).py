@@ -6,7 +6,7 @@ Run this on the dedicated machine ONCE. It stays running in the background
 and listens for requests from the team's webpage.
 
 Requirements:
-    pip install flask
+    pip install flask flask-cors
 
 Run:
     python server.py
@@ -22,28 +22,27 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # allows the HTML page to call this server from a browser
+CORS(app)
 
 # Path to the tracker script — must be in the same folder as server.py
-SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "track_outlook_mails_com.py")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_PATH = os.path.join(SCRIPT_DIR, "track_outlook_mails_com.py")
 
-# The running script process (None if not started)
+# Stop file — when this exists, the tracker shuts down cleanly
+STOP_FILE = os.path.join(SCRIPT_DIR, ".tracker_stop")
+
 tracker_process = None
 
 
 def is_running():
-    """Returns True if the tracker script is currently running."""
     global tracker_process
     if tracker_process is None:
         return False
-    # poll() returns None if process is still running, otherwise the exit code
     return tracker_process.poll() is None
 
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Returns whether the tracker is currently running."""
     return jsonify({
         "running": is_running(),
         "message": "Tracker is running" if is_running() else "Tracker is stopped"
@@ -52,67 +51,45 @@ def status():
 
 @app.route("/run", methods=["POST"])
 def run():
-    """Starts the tracker script if it is not already running."""
     global tracker_process
     if is_running():
-        return jsonify({
-            "success": False,
-            "message": "Tracker is already running"
-        })
+        return jsonify({"success": False, "message": "Tracker is already running"})
+    if os.path.exists(STOP_FILE):
+        os.remove(STOP_FILE)
     try:
-        tracker_process = subprocess.Popen(
-            [sys.executable, SCRIPT_PATH],
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
-        return jsonify({
-            "success": True,
-            "message": "Tracker started successfully"
-        })
+        tracker_process = subprocess.Popen([sys.executable, SCRIPT_PATH])
+        return jsonify({"success": True, "message": "Tracker started successfully"})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": f"Failed to start tracker: {e}"
-        }), 500
+        return jsonify({"success": False, "message": f"Failed to start: {e}"}), 500
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    """Stops the tracker script gracefully via SIGINT (same as Ctrl+C)
-    so the script's KeyboardInterrupt handler runs and updates the dashboard."""
     global tracker_process
     if not is_running():
-        return jsonify({
-            "success": False,
-            "message": "Tracker is not running"
-        })
+        return jsonify({"success": False, "message": "Tracker is not running"})
+
+    # Create stop file — script checks for this every poll cycle and exits cleanly
+    with open(STOP_FILE, "w") as f:
+        f.write("stop")
+
+    # Wait up to 60s for the script to finish its clean shutdown
     try:
-        import signal
-        # Send SIGINT (Ctrl+C equivalent) so the script's KeyboardInterrupt
-        # handler runs — this triggers the final dashboard update before exit
-        if sys.platform == "win32":
-            tracker_process.send_signal(signal.CTRL_C_EVENT)
-        else:
-            tracker_process.send_signal(signal.SIGINT)
-        tracker_process.wait(timeout=30)  # give it time to finish dashboard update
+        tracker_process.wait(timeout=60)
         tracker_process = None
-        return jsonify({
-            "success": True,
-            "message": "Tracker stopped — dashboard updated"
-        })
-    except Exception as e:
-        # Fall back to terminate if signal fails
-        try:
-            tracker_process.terminate()
-            tracker_process = None
-        except Exception:
-            pass
-        return jsonify({
-            "success": False,
-            "message": f"Stopped forcefully (dashboard may not have updated): {e}"
-        })
+        return jsonify({"success": True, "message": "Tracker stopped — dashboard updated"})
+    except subprocess.TimeoutExpired:
+        tracker_process.kill()
+        tracker_process = None
+        if os.path.exists(STOP_FILE):
+            os.remove(STOP_FILE)
+        return jsonify({"success": False,
+                        "message": "Stopped forcefully — dashboard may not have updated"})
 
 
 if __name__ == "__main__":
+    if os.path.exists(STOP_FILE):
+        os.remove(STOP_FILE)
     print("TechOps Tracker Server starting...")
     print(f"Script path: {SCRIPT_PATH}")
     print("Listening on http://EXLAPLPX4dnzrAk:5000")
