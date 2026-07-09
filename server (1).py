@@ -76,7 +76,8 @@ def run():
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    """Stops the tracker script if it is running."""
+    """Stops the tracker script gracefully via SIGINT (same as Ctrl+C)
+    so the script's KeyboardInterrupt handler runs and updates the dashboard."""
     global tracker_process
     if not is_running():
         return jsonify({
@@ -84,18 +85,30 @@ def stop():
             "message": "Tracker is not running"
         })
     try:
-        tracker_process.terminate()
-        tracker_process.wait(timeout=10)
+        import signal
+        # Send SIGINT (Ctrl+C equivalent) so the script's KeyboardInterrupt
+        # handler runs — this triggers the final dashboard update before exit
+        if sys.platform == "win32":
+            tracker_process.send_signal(signal.CTRL_C_EVENT)
+        else:
+            tracker_process.send_signal(signal.SIGINT)
+        tracker_process.wait(timeout=30)  # give it time to finish dashboard update
         tracker_process = None
         return jsonify({
             "success": True,
-            "message": "Tracker stopped"
+            "message": "Tracker stopped — dashboard updated"
         })
     except Exception as e:
+        # Fall back to terminate if signal fails
+        try:
+            tracker_process.terminate()
+            tracker_process = None
+        except Exception:
+            pass
         return jsonify({
             "success": False,
-            "message": f"Failed to stop tracker: {e}"
-        }), 500
+            "message": f"Stopped forcefully (dashboard may not have updated): {e}"
+        })
 
 
 if __name__ == "__main__":
