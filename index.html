@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TechOps Mail Tracker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #0D1B2A;
+      color: #F0F4F8;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .card {
+      background: #1B2A3B;
+      border: 1px solid #0B6E88;
+      border-radius: 12px;
+      padding: 48px 56px;
+      width: 480px;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+
+    h1 {
+      font-size: 24px;
+      font-weight: 700;
+      color: #FFFFFF;
+      margin-bottom: 6px;
+    }
+
+    .subtitle {
+      font-size: 13px;
+      color: #94A3B8;
+      margin-bottom: 40px;
+    }
+
+    /* Status indicator */
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 36px;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #94A3B8;
+      transition: background 0.3s;
+    }
+
+    .dot.running {
+      background: #10B981;
+      box-shadow: 0 0 8px #10B981;
+      animation: pulse 1.5s infinite;
+    }
+
+    .dot.stopped { background: #EF4444; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    .status-text {
+      font-size: 15px;
+      font-weight: 600;
+      color: #CBD5E1;
+    }
+
+    /* Buttons */
+    .buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+    }
+
+    button {
+      padding: 14px 36px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+
+    button:active { transform: scale(0.97); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #btn-start {
+      background: #10B981;
+      color: #FFFFFF;
+    }
+
+    #btn-stop {
+      background: #EF4444;
+      color: #FFFFFF;
+    }
+
+    /* Message banner */
+    .message {
+      margin-top: 28px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      display: none;
+    }
+
+    .message.success { background: #0D2B1F; color: #A7F3D0; }
+    .message.error   { background: #2D0A0A; color: #FCA5A5; }
+    .message.info    { background: #0D1E2B; color: #7DD3FC; }
+
+    .footer {
+      margin-top: 40px;
+      font-size: 11px;
+      color: #475569;
+    }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h1>TechOps Mail Tracker</h1>
+  <p class="subtitle">Digital Lending &amp; Payments — EXL Service</p>
+
+  <div class="status-row">
+    <div class="dot" id="dot"></div>
+    <span class="status-text" id="status-text">Checking...</span>
+  </div>
+
+  <div class="buttons">
+    <button id="btn-start" onclick="startTracker()" disabled>Start</button>
+    <button id="btn-stop"  onclick="stopTracker()"  disabled>Stop</button>
+  </div>
+
+  <div class="message" id="message"></div>
+
+  <div class="footer">
+    Tracker server: 192.168.100.209:5000 &nbsp;·&nbsp;
+    Status refreshes every 5 seconds
+  </div>
+</div>
+
+<script>
+  const SERVER = "http://192.168.100.209:5000";
+
+  function showMessage(text, type) {
+    const el = document.getElementById("message");
+    el.textContent = text;
+    el.className = "message " + type;
+    el.style.display = "block";
+    setTimeout(() => { el.style.display = "none"; }, 5000);
+  }
+
+  function updateUI(running) {
+    const dot        = document.getElementById("dot");
+    const statusText = document.getElementById("status-text");
+    const btnStart   = document.getElementById("btn-start");
+    const btnStop    = document.getElementById("btn-stop");
+
+    dot.className    = "dot " + (running ? "running" : "stopped");
+    statusText.textContent = running ? "Tracker is running" : "Tracker is stopped";
+    btnStart.disabled = running;
+    btnStop.disabled  = !running;
+  }
+
+  function checkStatus() {
+    fetch(`${SERVER}/status`)
+      .then(r => r.json())
+      .then(data => updateUI(data.running))
+      .catch(() => {
+        document.getElementById("dot").className = "dot";
+        document.getElementById("status-text").textContent = "Server unreachable";
+        document.getElementById("btn-start").disabled = true;
+        document.getElementById("btn-stop").disabled  = true;
+      });
+  }
+
+  function startTracker() {
+    document.getElementById("btn-start").disabled = true;
+    fetch(`${SERVER}/run`, { method: "POST" })
+      .then(r => r.json())
+      .then(data => {
+        showMessage(data.message, data.success ? "success" : "info");
+        checkStatus();
+      })
+      .catch(() => showMessage("Could not reach server.", "error"));
+  }
+
+  function stopTracker() {
+    document.getElementById("btn-stop").disabled = true;
+    fetch(`${SERVER}/stop`, { method: "POST" })
+      .then(r => r.json())
+      .then(data => {
+        showMessage(data.message, data.success ? "success" : "error");
+        checkStatus();
+      })
+      .catch(() => showMessage("Could not reach server.", "error"));
+  }
+
+  // Check status immediately and then every 5 seconds
+  checkStatus();
+  setInterval(checkStatus, 5000);
+</script>
+
+</body>
+</html>
