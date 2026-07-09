@@ -62,8 +62,6 @@ def run():
     try:
         tracker_process = subprocess.Popen(
             [sys.executable, SCRIPT_PATH],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
         )
         return jsonify({
             "success": True,
