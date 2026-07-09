@@ -62,6 +62,7 @@ def run():
     try:
         tracker_process = subprocess.Popen(
             [sys.executable, SCRIPT_PATH],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
         return jsonify({
             "success": True,
