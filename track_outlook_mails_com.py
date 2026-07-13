@@ -1827,6 +1827,10 @@ def listen():
                 if cmd == "start":
                     print("START command received — beginning.\n")
                     break
+                if cmd == "stop":
+                    # STOP arrived before START — reset to IDLE and keep waiting
+                    print("STOP received while idle — resetting to IDLE.")
+                    write_control_command("IDLE")
                 time.sleep(5)
 
             # ── Historical load ─────────────────────────────────────
