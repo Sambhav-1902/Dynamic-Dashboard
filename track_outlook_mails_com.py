@@ -1803,8 +1803,6 @@ def listen():
         return
 
     known_ids       = get_inbox_entry_ids(inbox)
-    poll_count      = 0
-    retry_queue     = []
     allowed_senders = load_allowed_senders()
 
     if known_ids is None:
@@ -1814,112 +1812,123 @@ def listen():
     print(f"Connected. {len(known_ids)} existing email(s) in inbox will be ignored.")
     print(f"Loaded {len(allowed_senders)} allowed sender(s).")
 
-    # Wait for START command from the control file before doing anything.
-    # Team members change tracker_control.txt to START from SharePoint.
-    print(f"\nWaiting for START command in '{CONTROL_FILE}'...")
-    print("Change the file contents to START on SharePoint to begin.\n")
-    while True:
-        cmd = read_control_command()
-        if cmd == "start":
-            print("START command received — beginning historical load.\n")
-            write_control_command("START")  # keep as START while running
-            break
-        time.sleep(5)
-
-    print("Checking for historical emails...")
-    allowed_senders = load_historical_emails_com(inbox, allowed_senders, retry_queue)
-
-    print("Updating dashboard...")
-    if update_dashboard(OUTPUT_FILE):
-        print("Dashboard updated.\n")
-    else:
-        print("Could not update dashboard right now.\n")
-
-    print(f"Listening — checking every {POLL_INTERVAL}s.")
-    print("Change tracker_control.txt to STOP on SharePoint to stop.\n")
-
+    # Outer loop — keeps the script alive indefinitely.
+    # Each iteration is one START→STOP cycle.
+    # Script only fully exits on Ctrl+C.
     while True:
         try:
-            time.sleep(POLL_INTERVAL)
-            poll_count += 1
+            # ── Wait for START ──────────────────────────────────────
+            print(f"\nWaiting for START command in tracker_control.txt on SharePoint...")
+            print("Change the file to START to begin.\n")
+            write_control_command("IDLE")
 
-            # Check for STOP command from SharePoint control file
-            cmd = read_control_command()
-            if cmd == "stop":
-                print("\nSTOP command received — updating dashboard before stopping...")
-                if update_dashboard(OUTPUT_FILE):
-                    print("Dashboard updated.")
-                else:
-                    print("Could not update dashboard.")
-                write_control_command("IDLE")  # reset for next run
-                print("Stopped. Control file reset to IDLE.")
-                break
+            while True:
+                cmd = read_control_command()
+                if cmd == "start":
+                    print("START command received — beginning.\n")
+                    break
+                time.sleep(5)
 
-            # Retry any emails that failed because Excel was open
-            if retry_queue:
-                still_failed = []
-                for em in retry_queue:
-                    if em["in_reply_to"]:
-                        wb            = openpyxl.load_workbook(OUTPUT_FILE)
-                        ws            = wb["Inbox Tracker"]
-                        target_row, _ = find_matching_row(em, ws)
-                        if target_row:
-                            result = update_existing_row(em, target_row, OUTPUT_FILE)
-                            if result == "new_issue":
-                                saved = append_new_email(em, OUTPUT_FILE)
-                                if not saved:
-                                    still_failed.append(em)
+            # ── Historical load ─────────────────────────────────────
+            retry_queue  = []
+            poll_count   = 0
+            allowed_senders = load_allowed_senders()
+            known_ids    = get_inbox_entry_ids(inbox)
+
+            print("Checking for historical emails...")
+            allowed_senders = load_historical_emails_com(inbox, allowed_senders, retry_queue)
+
+            print("Updating dashboard...")
+            if update_dashboard(OUTPUT_FILE):
+                print("Dashboard updated.\n")
+            else:
+                print("Could not update dashboard right now.\n")
+
+            print(f"Listening — checking every {POLL_INTERVAL}s.")
+            print("Change tracker_control.txt to STOP on SharePoint to stop.\n")
+
+            # ── Live polling loop ────────────────────────────────────
+            while True:
+                time.sleep(POLL_INTERVAL)
+                poll_count += 1
+
+                # Check for STOP command
+                cmd = read_control_command()
+                if cmd == "stop":
+                    print("\nSTOP command received — updating dashboard before stopping...")
+                    if update_dashboard(OUTPUT_FILE):
+                        print("Dashboard updated.")
+                    else:
+                        print("Could not update dashboard.")
+                    write_control_command("IDLE")
+                    print("Stopped. Returning to waiting state...\n")
+                    break  # breaks inner polling loop → goes back to outer wait loop
+
+                # Retry queue
+                if retry_queue:
+                    still_failed = []
+                    for em in retry_queue:
+                        if em["in_reply_to"]:
+                            wb            = openpyxl.load_workbook(OUTPUT_FILE)
+                            ws            = wb["Inbox Tracker"]
+                            target_row, _ = find_matching_row(em, ws)
+                            if target_row:
+                                result = update_existing_row(em, target_row, OUTPUT_FILE)
+                                if result == "new_issue":
+                                    saved = append_new_email(em, OUTPUT_FILE)
+                                    if not saved:
+                                        still_failed.append(em)
+                                    else:
+                                        print(f"Saved new issue from queue: '{em['subject']}'")
+                                elif result is True:
+                                    print(f"Updated from queue: '{em['subject']}'")
                                 else:
-                                    print(f"Saved new issue from queue: '{em['subject']}'")
-                            elif result is True:
-                                print(f"Updated from queue: '{em['subject']}'")
+                                    still_failed.append(em)
                             else:
-                                still_failed.append(em)
+                                saved = append_new_email(em, OUTPUT_FILE)
+                                if saved:
+                                    print(f"Saved from queue: '{em['subject']}'")
+                                else:
+                                    still_failed.append(em)
                         else:
                             saved = append_new_email(em, OUTPUT_FILE)
                             if saved:
                                 print(f"Saved from queue: '{em['subject']}'")
                             else:
                                 still_failed.append(em)
+                    retry_queue = still_failed
+                    if retry_queue:
+                        print(f"Excel still open — {len(retry_queue)} email(s) waiting.")
                     else:
-                        saved = append_new_email(em, OUTPUT_FILE)
-                        if saved:
-                            print(f"Saved from queue: '{em['subject']}'")
-                        else:
-                            still_failed.append(em)
-                retry_queue = still_failed
-                if retry_queue:
-                    print(f"Excel still open — {len(retry_queue)} email(s) waiting.")
-                else:
+                        update_dashboard(OUTPUT_FILE)
+
+                check_due_date_and_resolve(OUTPUT_FILE)
+
+                current_ids = get_inbox_entry_ids(inbox)
+                if current_ids is None:
+                    print(f"Could not reach Outlook this cycle — retrying in {POLL_INTERVAL}s...")
+                    continue
+
+                new_ids = current_ids - known_ids
+
+                if new_ids:
+                    for eid in new_ids:
+                        em = fetch_item_by_entry_id(namespace, eid)
+                        if em:
+                            if not is_allowed(em["sender_email"], allowed_senders) and not is_dl_email(em):
+                                print(f"Ignored: {em['sender_email']} (sender unknown and DL not in To/CC/BCC)")
+                                continue
+                            allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
+                            process_email(em, retry_queue, OUTPUT_FILE)
+                    known_ids = current_ids
                     update_dashboard(OUTPUT_FILE)
-
-            check_due_date_and_resolve(OUTPUT_FILE)
-
-            current_ids = get_inbox_entry_ids(inbox)
-            if current_ids is None:
-                print(f"Could not reach Outlook this cycle — retrying in {POLL_INTERVAL}s...")
-                continue
-
-            new_ids = current_ids - known_ids
-
-            if new_ids:
-                for eid in new_ids:
-                    em = fetch_item_by_entry_id(namespace, eid)
-                    if em:
-                        if not is_allowed(em["sender_email"], allowed_senders) and not is_dl_email(em):
-                            print(f"Ignored: {em['sender_email']} (sender unknown and DL not in To/CC/BCC)")
-                            continue
-                        allowed_senders = extract_and_update_senders(em["raw_msg"], allowed_senders)
-                        process_email(em, retry_queue, OUTPUT_FILE)
-                known_ids = current_ids
-                update_dashboard(OUTPUT_FILE)
-            else:
-                if poll_count % 4 == 0:
-                    queued_note = f"  ({len(retry_queue)} queued)" if retry_queue else ""
-                    print(f"Listening...  {datetime.now().strftime('%H:%M:%S')}{queued_note}")
+                else:
+                    if poll_count % 4 == 0:
+                        queued_note = f"  ({len(retry_queue)} queued)" if retry_queue else ""
+                        print(f"Listening...  {datetime.now().strftime('%H:%M:%S')}{queued_note}")
 
         except KeyboardInterrupt:
-            if retry_queue:
+            if 'retry_queue' in dir() and retry_queue:
                 print(f"\nNote: {len(retry_queue)} email(s) unsaved (Excel was open):")
                 for em in retry_queue:
                     print(f"   - '{em['subject']}' from {em['sender_email']}")
@@ -1929,8 +1938,8 @@ def listen():
             else:
                 print("Could not update dashboard.")
             write_control_command("IDLE")
-            print("Stopped. Control file reset to IDLE.")
-            break
+            print("Fully stopped. Goodbye.")
+            break  # exits the outer loop completely
 
 
 def main():
