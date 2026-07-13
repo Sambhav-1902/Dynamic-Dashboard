@@ -91,9 +91,33 @@ from collections import Counter, defaultdict
 from gliner import GLiNER
 from sentence_transformers import util as st_util
 
-OUTPUT_FILE          = "mail_tracker.xlsx"
+OUTPUT_FILE = r"C:\Users\ex_sambhavs\EXLService.com (I) Pvt. Ltd\Ravi Shekhar - Sambhav\Dynamic dashboard\mail_tracker.xlsx"
 ALLOWED_SENDERS_FILE = "allowed_senders.txt"
 POLL_INTERVAL        = 15  # seconds between inbox checks
+
+# SharePoint control file — team members edit this on SharePoint to start/stop.
+# OneDrive syncs it to this local path automatically.
+# Supported commands (case-insensitive): START, STOP, IDLE
+CONTROL_FILE = r"C:\Users\ex_sambhavs\EXLService.com (I) Pvt. Ltd\Ravi Shekhar - Sambhav\Dynamic dashboard\tracker_control.txt"
+
+
+def read_control_command():
+    """Reads the command from the SharePoint control file.
+    Returns lowercase: 'start', 'stop', or 'idle'. Defaults to 'idle' on error."""
+    try:
+        with open(CONTROL_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip().lower()
+    except Exception:
+        return "idle"
+
+
+def write_control_command(command):
+    """Writes a command to the SharePoint control file."""
+    try:
+        with open(CONTROL_FILE, "w", encoding="utf-8") as f:
+            f.write(command)
+    except Exception as e:
+        print(f"Could not update control file: {e}")
 
 # MAPI property tags used to read raw headers and resolve Exchange sender addresses
 PR_TRANSPORT_MESSAGE_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001E"
@@ -1790,6 +1814,18 @@ def listen():
     print(f"Connected. {len(known_ids)} existing email(s) in inbox will be ignored.")
     print(f"Loaded {len(allowed_senders)} allowed sender(s).")
 
+    # Wait for START command from the control file before doing anything.
+    # Team members change tracker_control.txt to START from SharePoint.
+    print(f"\nWaiting for START command in '{CONTROL_FILE}'...")
+    print("Change the file contents to START on SharePoint to begin.\n")
+    while True:
+        cmd = read_control_command()
+        if cmd == "start":
+            print("START command received — beginning historical load.\n")
+            write_control_command("START")  # keep as START while running
+            break
+        time.sleep(5)
+
     print("Checking for historical emails...")
     allowed_senders = load_historical_emails_com(inbox, allowed_senders, retry_queue)
 
@@ -1799,25 +1835,24 @@ def listen():
     else:
         print("Could not update dashboard right now.\n")
 
-    print(f"Listening — checking every {POLL_INTERVAL}s. Press Ctrl+C to stop.\n")
-
-    # Path to the stop file created by server.py when Stop button is clicked
-    STOP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tracker_stop")
+    print(f"Listening — checking every {POLL_INTERVAL}s.")
+    print("Change tracker_control.txt to STOP on SharePoint to stop.\n")
 
     while True:
         try:
             time.sleep(POLL_INTERVAL)
             poll_count += 1
 
-            # Check if server.py has requested a clean stop
-            if os.path.exists(STOP_FILE):
-                os.remove(STOP_FILE)
-                print("\nStop requested — updating dashboard before stopping...")
+            # Check for STOP command from SharePoint control file
+            cmd = read_control_command()
+            if cmd == "stop":
+                print("\nSTOP command received — updating dashboard before stopping...")
                 if update_dashboard(OUTPUT_FILE):
                     print("Dashboard updated.")
                 else:
                     print("Could not update dashboard.")
-                print("Stopped.")
+                write_control_command("IDLE")  # reset for next run
+                print("Stopped. Control file reset to IDLE.")
                 break
 
             # Retry any emails that failed because Excel was open
@@ -1893,7 +1928,8 @@ def listen():
                 print("Dashboard updated.")
             else:
                 print("Could not update dashboard.")
-            print("Stopped.")
+            write_control_command("IDLE")
+            print("Stopped. Control file reset to IDLE.")
             break
 
 
