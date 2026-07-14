@@ -339,6 +339,8 @@ OLLAMA_MODEL = "gemma3:1b"
 def is_conversation_resolved(conversation_log, original_sender):
     """Asks Gemma 3 1B (via local Ollama) whether every issue raised by original_sender
     has been resolved across the full conversation. Returns True (Resolved) or False (Ongoing).
+    Handles both explicit resolutions ('fixed', 'resolved') and implicit ones
+    ('please check now', 'we have made the change', 'it should work').
     Defaults to False if Ollama is unreachable."""
     prompt = f"""Below is a support ticket conversation, shown NEWEST message first. Each message shows the sender's email and their message.
 
@@ -347,10 +349,17 @@ Conversation:
 
 The person who raised this ticket is: {original_sender}
 
-Question: Has EVERY question or issue raised by {original_sender} (across all of their messages) been clearly and explicitly answered or fixed by the OTHER person's replies in this conversation?
+Question: Have the issues raised by {original_sender} been addressed by the other person?
 
-If even ONE question or issue from {original_sender} is still unanswered or unresolved, answer NO.
-Only answer YES if you can find an explicit answer/fix for EACH thing {original_sender} asked about.
+Consider the ticket RESOLVED (answer YES) if the other person has:
+- Explicitly confirmed the issue is fixed or resolved, OR
+- Taken a clear action to fix it (e.g. "we have made the change", "please check now", "it has been updated", "you should now be able to"), OR
+- Provided a complete answer to every question asked
+
+Consider the ticket ONGOING (answer NO) if:
+- Any question or issue from {original_sender} is still unanswered, OR
+- The other person only acknowledged receipt without taking action (e.g. "we will look into it", "noted", "we are checking"), OR
+- The fix or answer is unclear or incomplete
 
 Answer with ONLY one word: YES or NO."""
 
@@ -648,9 +657,10 @@ COL_MESSAGE_ID   = 14
 COL_WORTH        = 15
 
 STATUS_COLORS = {
-    "Pending":  "FFF2CC",
-    "Ongoing":  "DDEEFF",
-    "Resolved": "E2EFDA",
+    "Pending":    "FFF2CC",
+    "Ongoing":    "DDEEFF",
+    "Escalated":  "FFCCCC",  # red — Ongoing 3+ days, needs urgent attention
+    "Resolved":   "E2EFDA",
 }
 
 
@@ -809,9 +819,10 @@ def update_existing_row(em, target_row, filepath):
             status = "Pending"
             print(f"   Sender following up — Pending, followups now {new_followups}")
 
-        elif is_same_sender and current_status == "Ongoing":
-            status = "Ongoing"
-            print(f"   Sender adding info — stays Ongoing")
+        elif is_same_sender and current_status in ("Ongoing", "Escalated"):
+            # Keep Escalated if already escalated — employee reply doesn't de-escalate
+            status = current_status
+            print(f"   Sender adding info — stays {current_status}")
 
         else:
             print(f"   Reply from someone else — running resolution check...")
@@ -1260,15 +1271,46 @@ def load_historical_emails_com(inbox, allowed_senders, retry_queue):
 
 
 def check_due_date_and_resolve(filepath):
-    pass
+    """Auto-escalates any Ongoing ticket that has been open for 3 or more days.
+    Status changes from Ongoing → Escalated so the team is alerted.
+    Escalated tickets are highlighted red in both the tracker sheet and the dashboard."""
+    try:
+        wb = openpyxl.load_workbook(filepath)
+        ws = wb["Inbox Tracker"]
+        now = datetime.now()
+        changed = False
+        for row in range(2, ws.max_row + 1):
+            status = ws.cell(row=row, column=COL_STATUS).value
+            if status != "Ongoing":
+                continue
+            ongoing_since = ws.cell(row=row, column=COL_ONGOING_SINCE).value
+            if not ongoing_since:
+                continue
+            try:
+                since_dt = datetime.strptime(str(ongoing_since), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            days_open = (now - since_dt).days
+            if days_open >= 3:
+                status_cell = ws.cell(row=row, column=COL_STATUS, value="Escalated")
+                apply_status_color(status_cell, "Escalated")
+                print(f"   Escalated ticket #{ws.cell(row=row, column=COL_NUM).value} "
+                      f"(open {days_open} days): '{ws.cell(row=row, column=COL_SUBJECT).value}'")
+                changed = True
+        if changed:
+            wb.save(filepath)
+    except PermissionError:
+        pass
+    except Exception as e:
+        print(f"Escalation check error: {e}")
 
 
 # Dashboard generation
 
 
 DASH_SHEET          = "Dashboard"
-DASH_STATUSES       = ["Pending", "Ongoing", "Resolved"]
-DASH_STATUS_COLORS  = {"Pending": "FFC000", "Ongoing": "5B9BD5", "Resolved": "70AD47"}
+DASH_STATUSES       = ["Pending", "Ongoing", "Escalated", "Resolved"]
+DASH_STATUS_COLORS  = {"Pending": "FFC000", "Ongoing": "5B9BD5", "Escalated": "FF0000", "Resolved": "70AD47"}
 
 DASH_TITLE_FONT        = Font(bold=True, size=16, name="Arial", color="1F4E79")
 DASH_SUBTITLE_FONT     = Font(italic=True, size=9, name="Arial", color="888888")
@@ -1349,16 +1391,18 @@ def _dash_status_counts(tickets):
 
 
 def _dash_category_breakdown(tickets, categories):
-    """Counts Pending/Ongoing tickets per category and sums their worth.
+    """Counts Pending/Ongoing/Escalated tickets per category and sums their worth.
     Multi-label tickets count toward each category."""
     breakdown = {cat: {"Pending": 0, "Ongoing": 0, "worth": 0.0} for cat in categories}
     for t in tickets:
-        if t["status"] not in ("Pending", "Ongoing"):
+        if t["status"] not in ("Pending", "Ongoing", "Escalated"):
             continue
         cats = [c.strip() for c in (t["category"] or "").split(",") if c.strip()]
         for cat in cats:
             if cat in breakdown:
-                breakdown[cat][t["status"]] += 1
+                # Count Escalated tickets under Ongoing for chart purposes
+                key = "Ongoing" if t["status"] == "Escalated" else t["status"]
+                breakdown[cat][key] += 1
                 breakdown[cat]["worth"] += t.get("worth", 0.0)
     return breakdown
 
@@ -1427,15 +1471,21 @@ def _dash_assignee_breakdown(tickets):
 
 
 def _dash_ongoing_list(tickets, now):
-    """Returns Ongoing tickets sorted by days-in-Ongoing descending."""
-    ongoing = [t for t in tickets if t["status"] == "Ongoing"]
+    """Returns Ongoing and Escalated tickets sorted by priority:
+    Escalated tickets first (sorted by days open descending),
+    then Ongoing tickets (sorted by days open descending)."""
+    active = [t for t in tickets if t["status"] in ("Ongoing", "Escalated")]
     enriched = []
-    for t in ongoing:
+    for t in active:
         since_dt = _dash_parse_dt(t["ongoing_since"])
         days = (now - since_dt).days if since_dt else 0
         enriched.append({**t, "days_ongoing": days})
-    enriched.sort(key=lambda t: -t["days_ongoing"])
-    return enriched
+    # Escalated first, then Ongoing, each group sorted by days descending
+    escalated = sorted([t for t in enriched if t["status"] == "Escalated"],
+                       key=lambda t: -t["days_ongoing"])
+    ongoing   = sorted([t for t in enriched if t["status"] == "Ongoing"],
+                       key=lambda t: -t["days_ongoing"])
+    return escalated + ongoing
 
 
 def update_dashboard(filepath):
@@ -1583,12 +1633,18 @@ def update_dashboard(filepath):
     )
     pie.height = 9
     pie.width  = 12
+    # Show only percentages on slices — no category names on slices
+    # (prevents overlapping when some statuses have 0 or very small counts)
     pie.dataLabels = DataLabelList()
     pie.dataLabels.showVal       = False
     pie.dataLabels.showPercent   = True
-    pie.dataLabels.showCatName   = True
+    pie.dataLabels.showCatName   = False
     pie.dataLabels.showLegendKey = False
     pie.dataLabels.showSerName   = False
+    # Legend at bottom shows the status names clearly without overlapping
+    from openpyxl.chart.legend import Legend as _Legend
+    pie.legend = _Legend()
+    pie.legend.position = "b"
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{charts_row}")
 
@@ -1698,8 +1754,8 @@ def update_dashboard(filepath):
     # Section 5: Ongoing tickets list (with Worth column)
     # ------------------------------------------------------------------
     row = _dash_section_header(ws, row,
-        f"Ongoing Tickets ({len(ongoing_list)}) — Sorted by Days Ongoing", span=8)
-    for i, h in enumerate(["Ticket #", "Subject", "Assignee", "Category",
+        f"Ongoing & Escalated Tickets ({len(ongoing_list)}) — Escalated First", span=9)
+    for i, h in enumerate(["Ticket #", "Status", "Subject", "Assignee", "Category",
                             "Days Ongoing", "Worth ($)", "Sender"]):
         c = ws.cell(row=row, column=2 + i, value=h)
         c.font = DASH_TABLE_HEADER_FONT
@@ -1710,27 +1766,34 @@ def update_dashboard(filepath):
     thin   = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+    ESCALATED_FILL = PatternFill("solid", start_color="FF9999")
+
     if not ongoing_list:
         ws.cell(row=row, column=2,
-                value="No tickets are currently Ongoing.").font = DASH_VALUE_FONT
+                value="No tickets are currently Ongoing or Escalated.").font = DASH_VALUE_FONT
     else:
         for t in ongoing_list:
             worth_disp   = f"${t['worth']:.2f}" if t.get("worth", 0) > 0 else "—"
-            values       = [t["num"], t["subject"], t["assigned_to"] or "Unassigned",
-                            t["category"], t["days_ongoing"], worth_disp, t["sender_email"]]
-            long_ongoing = t["days_ongoing"] >= 14
-            row_fill     = DASH_URGENT_FILL if long_ongoing else PatternFill()
+            is_escalated = t["status"] == "Escalated"
+            values = [t["num"], t["status"], t["subject"],
+                      t["assigned_to"] or "Unassigned",
+                      t["category"], t["days_ongoing"], worth_disp, t["sender_email"]]
+            if is_escalated:
+                row_fill = ESCALATED_FILL
+            elif t["days_ongoing"] >= 14:
+                row_fill = DASH_URGENT_FILL
+            else:
+                row_fill = PatternFill()
             for col_offset, val in enumerate(values):
                 c = ws.cell(row=row, column=2 + col_offset, value=val)
-                c.font   = Font(name="Arial", size=10, bold=long_ongoing)
+                c.font   = Font(name="Arial", size=10, bold=is_escalated)
                 c.fill   = row_fill
                 c.border = border
-                if col_offset in (0, 4, 5):
+                if col_offset in (0, 1, 5, 6):
                     c.alignment = Alignment(horizontal="center", vertical="top")
                 else:
-                    c.alignment = Alignment(vertical="top", wrap_text=(col_offset == 1))
+                    c.alignment = Alignment(vertical="top", wrap_text=(col_offset == 2))
             row += 1
-
     ws.column_dimensions["A"].width = 2
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 35
