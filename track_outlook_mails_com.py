@@ -94,6 +94,8 @@ from sentence_transformers import util as st_util
 OUTPUT_FILE = r"C:\Users\ex_sambhavs\EXLService.com (I) Pvt. Ltd\Ravi Shekhar - Sambhav\Dynamic dashboard\mail_tracker.xlsx"
 ALLOWED_SENDERS_FILE = "allowed_senders.txt"
 POLL_INTERVAL        = 15  # seconds between inbox checks
+ESCALATE_DAYS        = 3   # days Ongoing before auto-escalating
+AUTO_RESOLVE_DAYS    = 7   # days since last employee reply before auto-resolving
 
 # SharePoint control file — team members edit this on SharePoint to start/stop.
 # OneDrive syncs it to this local path automatically.
@@ -1271,38 +1273,82 @@ def load_historical_emails_com(inbox, allowed_senders, retry_queue):
 
 
 def check_due_date_and_resolve(filepath):
-    """Auto-escalates any Ongoing ticket that has been open for 3 or more days.
-    Status changes from Ongoing → Escalated so the team is alerted.
-    Escalated tickets are highlighted red in both the tracker sheet and the dashboard."""
+    """Runs two automatic status updates every poll cycle:
+
+    1. Escalation: Ongoing tickets open 3+ days → Escalated
+    2. Auto-resolve: Ongoing/Escalated tickets where the last message was
+       from an @exlservice.com employee AND no client reply for 7+ days → Resolved
+
+    Returns True if any ticket status changed (caller should refresh dashboard).
+    """
     try:
         wb = openpyxl.load_workbook(filepath)
         ws = wb["Inbox Tracker"]
-        now = datetime.now()
+        now     = datetime.now()
         changed = False
+
         for row in range(2, ws.max_row + 1):
             status = ws.cell(row=row, column=COL_STATUS).value
-            if status != "Ongoing":
+            if status not in ("Ongoing", "Escalated"):
                 continue
-            ongoing_since = ws.cell(row=row, column=COL_ONGOING_SINCE).value
-            if not ongoing_since:
+
+            # ── Escalation check ──────────────────────────────────
+            if status == "Ongoing":
+                ongoing_since = ws.cell(row=row, column=COL_ONGOING_SINCE).value
+                if ongoing_since:
+                    try:
+                        since_dt  = datetime.strptime(str(ongoing_since), "%Y-%m-%d %H:%M:%S")
+                        days_open = (now - since_dt).days
+                        if days_open >= ESCALATE_DAYS:
+                            ws.cell(row=row, column=COL_STATUS, value="Escalated")
+                            apply_status_color(ws.cell(row=row, column=COL_STATUS), "Escalated")
+                            print(f"   Escalated ticket #{ws.cell(row=row, column=COL_NUM).value} "
+                                  f"(open {days_open} days): "
+                                  f"'{ws.cell(row=row, column=COL_SUBJECT).value}'")
+                            status  = "Escalated"
+                            changed = True
+                    except Exception:
+                        pass
+
+            # ── Auto-resolve check ────────────────────────────────
+            # Parse the first (newest) message from the Body column.
+            # Format: [2026-07-01 10:00:00] sender@email.com:\ntext
+            body = ws.cell(row=row, column=COL_BODY).value or ""
+            first_line = body.strip().split("\n")[0]  # newest message header
+            ts_match   = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+(\S+):', first_line)
+            if not ts_match:
                 continue
+
+            last_ts_str    = ts_match.group(1)
+            last_sender    = ts_match.group(2).lower().strip()
+            is_emp_reply   = "@exlservice.com" in last_sender
+
+            if not is_emp_reply:
+                continue  # last message was from client — not ready to auto-resolve
+
             try:
-                since_dt = datetime.strptime(str(ongoing_since), "%Y-%m-%d %H:%M:%S")
+                last_reply_dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S")
+                days_since    = (now - last_reply_dt).days
             except Exception:
                 continue
-            days_open = (now - since_dt).days
-            if days_open >= 3:
-                status_cell = ws.cell(row=row, column=COL_STATUS, value="Escalated")
-                apply_status_color(status_cell, "Escalated")
-                print(f"   Escalated ticket #{ws.cell(row=row, column=COL_NUM).value} "
-                      f"(open {days_open} days): '{ws.cell(row=row, column=COL_SUBJECT).value}'")
+
+            if days_since >= AUTO_RESOLVE_DAYS:
+                ws.cell(row=row, column=COL_STATUS, value="Resolved")
+                apply_status_color(ws.cell(row=row, column=COL_STATUS), "Resolved")
+                print(f"   Auto-resolved ticket #{ws.cell(row=row, column=COL_NUM).value} "
+                      f"(no client reply for {days_since} days): "
+                      f"'{ws.cell(row=row, column=COL_SUBJECT).value}'")
                 changed = True
+
         if changed:
             wb.save(filepath)
+        return changed
+
     except PermissionError:
-        pass
+        return False
     except Exception as e:
-        print(f"Escalation check error: {e}")
+        print(f"Status check error: {e}")
+        return False
 
 
 # Dashboard generation
@@ -1926,6 +1972,12 @@ def listen():
             else:
                 print("Could not update dashboard right now.\n")
 
+            # Run escalation immediately so dashboard reflects escalated tickets from the start
+            escalated = check_due_date_and_resolve(OUTPUT_FILE)
+            if escalated:
+                update_dashboard(OUTPUT_FILE)
+                print("Dashboard updated after escalation check.\n")
+
             print(f"Listening — checking every {POLL_INTERVAL}s.")
             print("Change tracker_control.txt to STOP on SharePoint to stop.\n")
 
@@ -1984,7 +2036,10 @@ def listen():
                     else:
                         update_dashboard(OUTPUT_FILE)
 
-                check_due_date_and_resolve(OUTPUT_FILE)
+                escalated = check_due_date_and_resolve(OUTPUT_FILE)
+                if escalated:
+                    update_dashboard(OUTPUT_FILE)
+                    print("Dashboard updated after escalation.")
 
                 current_ids = get_inbox_entry_ids(inbox)
                 if current_ids is None:
