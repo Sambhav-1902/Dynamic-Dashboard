@@ -1457,16 +1457,17 @@ def _dash_cat_worth_bracket_breakdown(tickets, categories):
 
 
 def _dash_assignee_breakdown(tickets):
-    """Counts Pending/Ongoing tickets per assignee. Multi-assignee tickets count toward each.
-    Returns top 12 by total, with unassigned tickets grouped under 'Unassigned'."""
-    breakdown = defaultdict(lambda: {"Pending": 0, "Ongoing": 0})
+    """Counts Pending/Ongoing/Escalated tickets per assignee.
+    Multi-assignee tickets count toward each. Returns top 12 by total."""
+    breakdown = defaultdict(lambda: {"Pending": 0, "Ongoing": 0, "Escalated": 0})
     for t in tickets:
-        if t["status"] not in ("Pending", "Ongoing"):
+        if t["status"] not in ("Pending", "Ongoing", "Escalated"):
             continue
         names = [a.strip() for a in (t["assigned_to"] or "").split(",") if a.strip()] or ["Unassigned"]
         for name in names:
             breakdown[name][t["status"]] += 1
-    sorted_items = sorted(breakdown.items(), key=lambda kv: -(kv[1]["Pending"] + kv[1]["Ongoing"]))
+    sorted_items = sorted(breakdown.items(),
+                          key=lambda kv: -(kv[1]["Pending"] + kv[1]["Ongoing"] + kv[1]["Escalated"]))
     return dict(sorted_items[:12])
 
 
@@ -1569,11 +1570,13 @@ def update_dashboard(filepath):
     dws.cell(row=ASGN_ROW, column=10, value="Assignee")
     dws.cell(row=ASGN_ROW, column=11, value="Pending")
     dws.cell(row=ASGN_ROW, column=12, value="Ongoing")
+    dws.cell(row=ASGN_ROW, column=13, value="Escalated")
     for i, (name, counts) in enumerate(assignee_breakdown.items()):
         r = ASGN_ROW + 1 + i
         dws.cell(row=r, column=10, value=name)
         dws.cell(row=r, column=11, value=counts["Pending"])
         dws.cell(row=r, column=12, value=counts["Ongoing"])
+        dws.cell(row=r, column=13, value=counts["Escalated"])
     asgn_end = ASGN_ROW + len(assignee_breakdown)
 
     # Worth-bucket totals: col N (label), O (count)
@@ -1599,12 +1602,13 @@ def update_dashboard(filepath):
     row = 5
     row = _dash_section_header(ws, row, "Overview")
     for label, value, numfmt in [
-        ("Total Tickets",          total,                     None),
-        ("Pending",                status_counts["Pending"],  None),
-        ("Ongoing",                status_counts["Ongoing"],  None),
-        ("Resolved",               status_counts["Resolved"], None),
-        ("Resolution Rate",        resolution_rate,           "0.0%"),
-        ("Avg Followups / Ticket", avg_followups,             "0.00"),
+        ("Total Tickets",          total,                        None),
+        ("Pending",                status_counts["Pending"],     None),
+        ("Ongoing",                status_counts["Ongoing"],     None),
+        ("Escalated",              status_counts["Escalated"],   None),
+        ("Resolved",               status_counts["Resolved"],    None),
+        ("Resolution Rate",        resolution_rate,              "0.0%"),
+        ("Avg Followups / Ticket", avg_followups,                "0.00"),
     ]:
         ws.cell(row=row, column=2, value=label).font = DASH_LABEL_FONT
         c = ws.cell(row=row, column=4, value=value)
@@ -1645,6 +1649,19 @@ def update_dashboard(filepath):
     from openpyxl.chart.legend import Legend as _Legend
     pie.legend = _Legend()
     pie.legend.position = "b"
+    # Set explicit slice colors — Pending=yellow, Ongoing=blue, Escalated=red, Resolved=green
+    from openpyxl.chart.marker import DataPoint
+    PIE_SLICE_COLORS = {
+        "Pending":   "FFC000",
+        "Ongoing":   "5B9BD5",
+        "Escalated": "FF0000",
+        "Resolved":  "70AD47",
+    }
+    pie_series = pie.series[0]
+    for idx_s, status in enumerate(DASH_STATUSES):
+        pt = DataPoint(idx=idx_s)
+        pt.graphicalProperties.solidFill = PIE_SLICE_COLORS.get(status, "888888")
+        pie_series.dPt.append(pt)
     _dash_set_title(pie, size_pt=14)
     ws.add_chart(pie, f"B{charts_row}")
 
@@ -1657,7 +1674,6 @@ def update_dashboard(filepath):
     cat_brkt_bar.title    = "Tickets by Category & Worth ($)"
     cat_brkt_bar.y_axis.title = "Number of Tickets"
     cat_brkt_bar.y_axis.numFmt    = "0"
-    cat_brkt_bar.y_axis.majorUnit = 1
     cat_brkt_bar.add_data(
         Reference(dws, min_col=5, max_col=cat_brkt_last_col,
                   min_row=CAT_BRKT_ROW, max_row=cat_brkt_end),
@@ -1694,10 +1710,9 @@ def update_dashboard(filepath):
     assignee_bar.grouping = "clustered"
     assignee_bar.title    = "Tickets by Assignee"
     assignee_bar.y_axis.title = "Number of Tickets"
-    assignee_bar.y_axis.numFmt    = "0"
-    assignee_bar.y_axis.majorUnit = 1
+    assignee_bar.y_axis.numFmt = "0"
     assignee_bar.add_data(
-        Reference(dws, min_col=11, max_col=12,
+        Reference(dws, min_col=11, max_col=13,
                   min_row=ASGN_ROW, max_row=asgn_end),
         titles_from_data=True,
     )
@@ -1707,6 +1722,7 @@ def update_dashboard(filepath):
     )
     assignee_bar.series[0].graphicalProperties.solidFill = DASH_STATUS_COLORS["Pending"]
     assignee_bar.series[1].graphicalProperties.solidFill = DASH_STATUS_COLORS["Ongoing"]
+    assignee_bar.series[2].graphicalProperties.solidFill = DASH_STATUS_COLORS["Escalated"]
     assignee_bar.height = 9
     assignee_bar.width  = 18
     assignee_bar.x_axis.textRotation = -30
@@ -1729,7 +1745,6 @@ def update_dashboard(filepath):
     worth_bar.title    = "Tickets by Worth ($)"
     worth_bar.y_axis.title = "Number of Tickets"
     worth_bar.y_axis.numFmt    = "0"
-    worth_bar.y_axis.majorUnit = 1
     worth_bar.add_data(
         Reference(dws, min_col=15,
                   min_row=WBKT_ROW, max_row=wbkt_end),
