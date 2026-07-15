@@ -1,0 +1,47 @@
+Subject: Internship Summary — Sambhav Singwi, DE & AI Intern, Digital Lending & Payments
+
+Dear [Executive's Name],
+
+I hope this message finds you well. I am writing to summarise the work I completed during my six-week internship with the Digital Lending & Payments team at EXL Service, under the guidance of Ravi Shekhar.
+
+I had the opportunity to contribute to two pieces of work during my time here.
+
+
+1. TechOps Dynamic Dashboard — Automated Support Ticket Tracking
+
+The TechOps team receives a high volume of support emails from clients every day covering issues such as payment failures, loan processing delays, and system errors. Previously, every email had to be manually read, logged into an Excel sheet, and tracked by hand — a time-consuming process that left managers with no real-time visibility into what was open, who was working on what, or how long issues had been waiting.
+
+I built a system that automates this entire process. It reads incoming support emails automatically, understands what type of issue each email is about, and logs every ticket into a shared file that the whole team can access. A live dashboard updates itself after every new email, giving managers an instant view of:
+
+• How many tickets are open, in progress, or resolved
+• Which types of issues are most frequent and which carry the highest financial value
+• How the workload is distributed across team members
+• Which tickets have been waiting too long and need urgent attention
+
+Tickets that remain unresolved for more than three days are automatically flagged for escalation. Tickets where the team has responded and the client has not followed up for a week are automatically marked as resolved. The entire system runs in the background with no manual effort required from the team.
+
+The output is stored on SharePoint, so any authorised team member can view the dashboard from any device at any time. The system is live and being used by the TechOps team today.
+
+What makes this particularly valuable beyond the immediate use case is how broadly it can be applied. Any team at EXL that manages client communication through a shared email address can adopt this system with virtually no additional effort — it simply needs to be pointed at a different inbox. There is no new software to install for the team, no change to how clients send emails, and no training required beyond editing a single word in a file on SharePoint to start or stop the system.
+
+From a business perspective, this means the organisation gains a standardised, auditable record of every client interaction — when it arrived, how long it took to respond, who handled it, and whether it was resolved to the client's satisfaction. Over time, the data this system captures can reveal patterns that are invisible today: which issue types are growing, which clients raise the most high-value tickets, and where resolution times are falling short of expectations. These are insights that could directly inform staffing decisions, process improvements, and client relationship management.
+
+The system is also designed with a clear path to full cloud deployment. When the appropriate IT approvals are in place, it can be migrated to run entirely on Microsoft's cloud infrastructure — available 24 hours a day, seven days a week, with no dependency on any single machine or individual.
+
+
+2. Pagaya Process Flow — FNBO Client
+
+I also contributed to the Pagaya process flow work for the FNBO client. [Please add 1-2 sentences here about your specific contribution.]
+
+
+Reflection
+
+This internship was a valuable experience that gave me the chance to work on a real business problem and deliver something that is genuinely useful to the team. I am grateful to Ravi Shekhar and the Digital Lending & Payments team for their support and mentorship throughout.
+
+Thank you for the opportunity to be part of EXL Service this summer. I would be happy to discuss either project in more detail if you would find that useful.
+
+Warm regards,
+Sambhav Singwi
+DE & AI Intern — Digital Lending & Payments
+EXL Service | 2025
+[Your phone number]
